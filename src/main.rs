@@ -1,6 +1,7 @@
 mod alert;
 mod discord_sender;
 mod lxmf_sender;
+mod meshcore_sender;
 mod meshtastic_sender;
 mod sender;
 mod spool;
@@ -16,6 +17,7 @@ use csv::ReaderBuilder;
 use discord_sender::DiscordSender;
 use log::LevelFilter;
 use lxmf_sender::{LxmfConfig, LxmfSender};
+use meshcore_sender::{MeshCoreConfig, MeshCoreSender};
 use meshtastic_sender::{MeshtasticConfig, MeshtasticSender};
 use rust_embed::RustEmbed;
 use sameold::{Message, SameReceiverBuilder, SignificanceLevel};
@@ -144,6 +146,18 @@ struct Args {
     /// Optional LXMF helper configuration path
     #[arg(long)]
     lxmf_config: Option<PathBuf>,
+
+    /// Optional MeshCore send helper command for best-effort alert delivery
+    #[arg(long)]
+    meshcore_command: Option<PathBuf>,
+
+    /// Optional MeshCore destination for best-effort alert delivery
+    #[arg(long)]
+    meshcore_destination: Option<String>,
+
+    /// Optional MeshCore helper configuration path
+    #[arg(long)]
+    meshcore_config: Option<PathBuf>,
 }
 
 fn build_fanout(args: &Args) -> Result<FanOut> {
@@ -181,6 +195,33 @@ fn build_fanout(args: &Args) -> Result<FanOut> {
         (None, Some(_)) => {
             return Err(anyhow::anyhow!(
                 "--lxmf-destination requires --lxmf-command"
+            ));
+        }
+    }
+
+    match (&args.meshcore_command, &args.meshcore_destination) {
+        (Some(command), Some(destination)) => {
+            best_effort_senders.push(Box::new(MeshCoreSender::new(MeshCoreConfig {
+                command: command.clone(),
+                destination: destination.clone(),
+                config: args.meshcore_config.clone(),
+            })));
+        }
+        (None, None) => {
+            if args.meshcore_config.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--meshcore-config requires --meshcore-command and --meshcore-destination"
+                ));
+            }
+        }
+        (Some(_), None) => {
+            return Err(anyhow::anyhow!(
+                "--meshcore-command requires --meshcore-destination"
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(anyhow::anyhow!(
+                "--meshcore-destination requires --meshcore-command"
             ));
         }
     }
@@ -456,6 +497,53 @@ mod tests {
     }
 
     #[test]
+    fn fanout_registers_no_meshcore_sender_without_meshcore_flags() {
+        let args = Args::try_parse_from(["alerter"]).unwrap();
+        let fanout = build_fanout(&args).unwrap();
+
+        assert_eq!(fanout.required_sender_count(), 1);
+        assert_eq!(fanout.best_effort_sender_count(), 0);
+    }
+
+    #[test]
+    fn fanout_registers_meshcore_as_best_effort_when_required_flags_are_provided() {
+        let args = Args::try_parse_from([
+            "alerter",
+            "--meshcore-command",
+            "meshcore-send",
+            "--meshcore-destination",
+            "room-123",
+        ])
+        .unwrap();
+        let fanout = build_fanout(&args).unwrap();
+
+        assert_eq!(fanout.required_sender_count(), 1);
+        assert_eq!(fanout.best_effort_sender_count(), 1);
+    }
+
+    #[test]
+    fn fanout_registers_discord_lxmf_and_meshcore_as_best_effort_when_configured() {
+        let args = Args::try_parse_from([
+            "alerter",
+            "--discord-webhook-url",
+            "https://discord.example/webhook",
+            "--lxmf-command",
+            "lxmf-send",
+            "--lxmf-destination",
+            "dest-123",
+            "--meshcore-command",
+            "meshcore-send",
+            "--meshcore-destination",
+            "room-123",
+        ])
+        .unwrap();
+        let fanout = build_fanout(&args).unwrap();
+
+        assert_eq!(fanout.required_sender_count(), 1);
+        assert_eq!(fanout.best_effort_sender_count(), 3);
+    }
+
+    #[test]
     fn partial_lxmf_config_returns_clear_error() {
         let command_only =
             Args::try_parse_from(["alerter", "--lxmf-command", "lxmf-send"]).unwrap();
@@ -476,6 +564,30 @@ mod tests {
         assert_eq!(
             build_fanout(&config_only).err().unwrap().to_string(),
             "--lxmf-config requires --lxmf-command and --lxmf-destination"
+        );
+    }
+
+    #[test]
+    fn partial_meshcore_config_returns_clear_error() {
+        let command_only =
+            Args::try_parse_from(["alerter", "--meshcore-command", "meshcore-send"]).unwrap();
+        assert_eq!(
+            build_fanout(&command_only).err().unwrap().to_string(),
+            "--meshcore-command requires --meshcore-destination"
+        );
+
+        let destination_only =
+            Args::try_parse_from(["alerter", "--meshcore-destination", "room-123"]).unwrap();
+        assert_eq!(
+            build_fanout(&destination_only).err().unwrap().to_string(),
+            "--meshcore-destination requires --meshcore-command"
+        );
+
+        let config_only =
+            Args::try_parse_from(["alerter", "--meshcore-config", "meshcore-config"]).unwrap();
+        assert_eq!(
+            build_fanout(&config_only).err().unwrap().to_string(),
+            "--meshcore-config requires --meshcore-command and --meshcore-destination"
         );
     }
 }
