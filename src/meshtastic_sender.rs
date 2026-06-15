@@ -140,6 +140,10 @@ impl MeshtasticSender {
 }
 
 impl Sender for MeshtasticSender {
+    fn name(&self) -> &'static str {
+        "meshtastic"
+    }
+
     fn check_ready(&self) -> Result<()> {
         let output = self
             .runner
