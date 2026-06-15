@@ -1,18 +1,21 @@
+mod alert;
+mod meshtastic_sender;
+mod sender;
+
+use alert::{Alert, AlertSignificance};
 use anyhow::Result;
 use byteorder::{NativeEndian, ReadBytesExt};
-use csv::ReaderBuilder;
-use log::{info, LevelFilter, log};
-use rust_embed::RustEmbed;
 use clap::Parser;
+use csv::ReaderBuilder;
+use log::LevelFilter;
+use meshtastic_sender::{MeshtasticConfig, MeshtasticSender};
+use rust_embed::RustEmbed;
 use sameold::{Message, SameReceiverBuilder, SignificanceLevel};
+use sender::FanOut;
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
 use std::collections::HashMap;
-use std::env::args;
 use std::io::{self};
-use std::time::{Duration, Instant};
-use tokio::time::sleep;
-use std::process::{Command, Stdio};
 use strum::EnumMessage;
 
 #[derive(RustEmbed)]
@@ -26,144 +29,7 @@ struct Record {
     state: String,
 }
 
-struct MessageSender {
-    last_message_time: Option<Instant>,
-}
-
-impl MessageSender {
-    fn new() -> Self {
-        MessageSender {
-            last_message_time: None,
-        }
-    }
-
-    async fn send_message_with_retry(
-        &mut self,
-        chan: u32,
-        message: &str,
-        retries: u32,
-        delay: Duration,
-        args: Args,
-    ) -> Result<(), String> {
-        // Ensure at least 20 seconds between messages
-        if let Some(last_time) = self.last_message_time {
-            let elapsed = last_time.elapsed();
-            if elapsed < Duration::from_secs(20) {
-                sleep(Duration::from_secs(20) - elapsed).await;
-            }
-        }
-
-        for attempt in 0..=retries {
-            // Create a new Command instance
-            let mut command = Command::new("meshtastic");
-                command.arg("--no-nodes");
-                command.arg("--no-time");
-                command.arg("--ch-index");
-                command.arg(chan.to_string());
-                command.arg("--sendtext");
-                command.arg(message.to_string()); // Convert message to String to extend its lifetime
-                command.arg("--ack");
-
-            // Conditionally add the host argument if provided
-            if let Some(host) = &args.host {
-                command.arg("--host").arg(host);
-            }
-            
-            // Conditionally add the port argument if provided
-            if let Some(port) = &args.port {
-                command.arg("--port").arg(port);
-            }
-
-            // Execute the command
-            let result = command.spawn();
-
-            match result {
-                Ok(_) => {
-                    self.last_message_time = Some(Instant::now());
-                    return Ok(());
-                }
-                Err(e) => {
-                    if attempt < retries {
-                        log::warn!("Error sending message: {}. Retrying in {:?}...", e, delay);
-                        sleep(delay).await;
-                    } else {
-                        log::error!("Error sending message after {} attempts: {}", retries, e);
-                        return Err(format!("Failed to send message: {}", e));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-
-
-}
-
-async fn check_node_connection(args: Args) -> Result<()> {
-    // Construct the command to run `meshtastic --info`
-    let mut cmd = Command::new("meshtastic");
-
-
-
-    // Conditionally add the "--host" argument if the host is provided
-    if let Some(host) = &args.host {
-        cmd.arg("--host");
-        cmd.arg(host);  // Add host argument here
-    }
-
-    // Conditionally add the "--port" argument if the serial port is provided ie. /dev/ttyUSB0
-    if let Some(port) = &args.port {
-        cmd.arg("--port");
-        cmd.arg(port);  // Add port argument here
-    }
-
-
-    // Add the --info argument
-    cmd.arg("--info");
-
-    // Ensure the command doesn't output to the console
-    cmd.stdout(Stdio::piped());
-
-    // Run the command and capture the output
-    let output = cmd.output();
-
-    match output {
-        Ok(output) => {
-            // Convert the stdout to a string (output is captured as bytes)
-            let stdout = String::from_utf8_lossy(&output.stdout);
-
-            // Check if the output contains "Error"
-            if stdout.contains("Error") {
-                log::error!("Received error output: {}", stdout);
-                std::process::exit(1);
-            }
-
-
-            // Check the first line of the output
-            if let Some(first_line) = stdout.lines().next() {
-                if first_line == "Connected to radio" {
-                    log::info!("Successfully connected to the node.");
-                    return Ok(());
-                } else {
-                    log::error!("Failed to connect to the radio. First line: {}", first_line);
-                    std::process::exit(1);
-                }
-            } else {
-                log::error!("Output from meshtastic --info was empty.");
-                std::process::exit(1);
-            }
-        }
-        Err(e) => {
-            // Log error if the command failed to run
-            log::error!("Failed to execute meshtastic --info: {}", e);
-            std::process::exit(1);
-        }
-    }
-
-}
-
-async fn load_csv_into_hashmap() -> HashMap<String, (String, String)> {
+fn load_csv_into_hashmap() -> HashMap<String, (String, String)> {
     let mut map = HashMap::new();
 
     let csv_data = Asset::get("sameCodes.csv").unwrap();
@@ -181,7 +47,6 @@ async fn load_csv_into_hashmap() -> HashMap<String, (String, String)> {
     map
 }
 
-
 fn search_by_code<'a>(
     map: &'a HashMap<String, (String, String)>,
     code: &str,
@@ -189,7 +54,41 @@ fn search_by_code<'a>(
     map.get(code)
 }
 
-#[derive(Parser, Debug)]
+fn alert_significance(significance: SignificanceLevel) -> AlertSignificance {
+    match significance {
+        SignificanceLevel::Test => AlertSignificance::Test,
+        SignificanceLevel::Statement => AlertSignificance::Statement,
+        SignificanceLevel::Emergency => AlertSignificance::Emergency,
+        SignificanceLevel::Watch => AlertSignificance::Watch,
+        SignificanceLevel::Warning => AlertSignificance::Warning,
+        SignificanceLevel::Unknown => AlertSignificance::Unknown,
+    }
+}
+
+fn location_name(map: &HashMap<String, (String, String)>, code: &str) -> Option<String> {
+    search_by_code(map, &format!("0{}", &code[1..])).map(|(county, _state)| {
+        let mut location = String::new();
+
+        match code.chars().next().unwrap_or_default() {
+            '0' => {}
+            '1' => location.push_str("Northwest "),
+            '2' => location.push_str("North "),
+            '3' => location.push_str("Northeast "),
+            '4' => location.push_str("West "),
+            '5' => location.push_str("Central "),
+            '6' => location.push_str("East "),
+            '7' => location.push_str("Southwest "),
+            '8' => location.push_str("South "),
+            '9' => location.push_str("Southeast "),
+            _ => {}
+        }
+
+        location.push_str(county);
+        location
+    })
+}
+
+#[derive(Parser, Debug, Clone)]
 #[command(long_about = None)]
 struct Args {
     /// Channel to which alerts are sent to, if not provided will default to channel 0
@@ -215,11 +114,9 @@ struct Args {
     /// Location codes that must be present to send an alert
     #[arg(long, short, value_delimiter = ',', default_value = None, required = false)]
     locations: Vec<String>,
-
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Initialize logging
     SimpleLogger::new()
         .with_level(LevelFilter::Off)
@@ -236,7 +133,6 @@ async fn main() -> Result<()> {
 
     // Parse the command line arguments
     let args = Args::parse();
-
 
     // Handle alertChannel argument
     if let Some(alert_channel_arg) = args.alert_channel {
@@ -258,7 +154,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    check_node_connection(Args::parse()).await.expect("Failed to check node connection");
+    let mut fanout = FanOut::new(vec![Box::new(MeshtasticSender::new(MeshtasticConfig {
+        host: args.host.clone(),
+        port: args.port.clone(),
+    }))]);
+
+    if let Err(e) = fanout.check_ready() {
+        log::error!("{}", e);
+        std::process::exit(1);
+    }
 
     // Create a SameReceiver.
     let mut rx = SameReceiverBuilder::new(args.rate)
@@ -276,7 +180,7 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let map = load_csv_into_hashmap().await;
+    let map = load_csv_into_hashmap();
     log::info!("Loaded locations CSV");
 
     let stdin_handle = stdin.lock();
@@ -284,8 +188,6 @@ async fn main() -> Result<()> {
 
     // Create an iterator for audio source from stdin, reading i16 and converting to f32
     let audiosrc = std::iter::from_fn(|| inbuf.read_i16::<NativeEndian>().ok());
-
-    let mut sender = MessageSender::new();
 
     log::info!("Monitoring for alerts");
     log::info!("Alerts will be sent to channel: {}", alert_channel);
@@ -303,9 +205,11 @@ async fn main() -> Result<()> {
                 log::info!("Begin SAME voice message: {:?}", hdr);
                 let mut message: String;
                 let mut send_channel: u32 = alert_channel;
+                let codes: Vec<String> = hdr.location_str_iter().map(|s| s.to_string()).collect();
+                let mut locations_found = Vec::new();
 
-                message = ", Issued By: ".to_string()
-                    + hdr.originator().get_detailed_message().unwrap();
+                message =
+                    ", Issued By: ".to_string() + hdr.originator().get_detailed_message().unwrap();
                 match evt.significance() {
                     SignificanceLevel::Test => {
                         send_channel = test_channel;
@@ -335,7 +239,6 @@ async fn main() -> Result<()> {
                         message = "🚨".to_string() + &evt.to_string() + &*message;
                     }
                 }
-                let codes: Vec<String> = hdr.location_str_iter().map(|s| s.to_string()).collect();
 
                 if hdr.is_national() {
                     message += " Nationwide Alert"
@@ -347,7 +250,11 @@ async fn main() -> Result<()> {
 
                         let has_match = codes.iter().any(|code| {
                             let matches = args.locations.contains(code);
-                            log::debug!("Comparing alert code '{}' with provided locations: {}", code, matches);
+                            log::debug!(
+                                "Comparing alert code '{}' with provided locations: {}",
+                                code,
+                                matches
+                            );
                             matches
                         });
 
@@ -358,35 +265,14 @@ async fn main() -> Result<()> {
                             log::info!("Alert has matching locations, proceeding to send");
                         }
                     } else {
-                        log::info!("No location filter applied (locations empty) or no locations in alert");
+                        log::info!(
+                            "No location filter applied (locations empty) or no locations in alert"
+                        );
                     }
 
-                    let mut locations_found = Vec::new();
-
                     // Pass each code into the function and collect the results
-                    for code in codes {
-                        if let Some((county, _state)) =
-                            search_by_code(&map, &format!("0{}", &code[1..]))
-                        {
-                            let mut location = String::new();
-
-                            // Determining where in the county the location is
-                            // https://www.weather.gov/nwr/sameenz
-                            match code.chars().next().unwrap_or_default() {
-                                '0' => {}
-                                '1' => location.push_str("Northwest "),
-                                '2' => location.push_str("North "),
-                                '3' => location.push_str("Northeast "),
-                                '4' => location.push_str("West "),
-                                '5' => location.push_str("Central "),
-                                '6' => location.push_str("East "),
-                                '7' => location.push_str("Southwest "),
-                                '8' => location.push_str("South "),
-                                '9' => location.push_str("Southeast "),
-                                _ => {}
-                            }
-
-                            location.push_str(county);
+                    for code in &codes {
+                        if let Some(location) = location_name(&map, code) {
                             locations_found.push(location);
                         } else {
                             log::debug!("Location Code: {} not found", code);
@@ -405,30 +291,20 @@ async fn main() -> Result<()> {
 
                 log::info!("Attempting to send message over the mesh: {}", message);
 
-                // Split and send the message in chunks of 75 characters, using retry logic
-                let mut myvec: Vec<usize> = message.bytes().enumerate().filter(|(_,c)| *c == b' ').map(|(i,_)| i).collect::<Vec<_>>();
-                let mut curpos: usize = 0;
-                let mut curlen: usize = 0;
-                let mut startpos: usize = 0;
-                for i in myvec.iter_mut() {
-                    if curlen + *i - curpos > 75 {
-                        sender
-                            .send_message_with_retry(send_channel, &message[startpos..(startpos + curlen)], 3, Duration::from_secs(5), Args::parse())
-                            .await.expect("Failed sending msg");
-                        curpos = startpos + curlen;
-                        startpos += curlen;
-                        curlen = 0;
-                    } else {
-                        curlen += *i - curpos;
-                        curpos = *i;
-                    }
-                }
-                curlen = message.len() - startpos;
-                if curlen != 0 {
-                    sender
-                        .send_message_with_retry(send_channel, &message[startpos..(startpos + curlen)], 3, Duration::from_secs(5), Args::parse())
-                        .await.expect("Failed sending msg");
-                }
+                let alert = Alert::new(
+                    evt.to_string(),
+                    alert_significance(evt.significance()),
+                    hdr.originator().get_detailed_message().unwrap().to_string(),
+                    hdr.callsign().to_string(),
+                    hdr.is_national(),
+                    codes,
+                    locations_found,
+                    message,
+                );
+
+                fanout
+                    .send_alert(&alert, send_channel)
+                    .expect("Failed sending msg");
             }
             Message::EndOfMessage => {
                 log::info!("End SAME voice message");
