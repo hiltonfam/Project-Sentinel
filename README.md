@@ -1,200 +1,176 @@
-# Sentinel
+# Project Sentinel
 
-**Offline-first emergency alerting and disaster communications platform**
+Project Sentinel is an offline-first NOAA SAME/EAS alert relay for resilient emergency communications. It decodes NOAA Weather Radio SAME alerts from an SDR audio stream, applies local routing and county filtering rules, and sends alert text to a Meshtastic mesh as the required primary delivery path.
 
-Sentinel is an open-source emergency communications platform designed to operate during natural disasters, industrial incidents, and prolonged infrastructure outages.
+Sentinel extends the upstream [RCGV1/Meshtastic-SAME-EAS-Alerter](https://github.com/RCGV1/Meshtastic-SAME-EAS-Alerter) project. The upstream project provided the foundation for SAME decoding, county filtering, alert formatting, and Meshtastic CLI delivery. Sentinel preserves that behavior while adding a synchronous sender/fan-out architecture, an optional Discord webhook sender, and an optional best-effort failure spool.
 
-The project began as a fork of Meshtastic-SAME-EAS-Alerter and has evolved into a broader effort to provide resilient, multi-network alert dissemination and situational awareness capabilities.
+## Mission
 
-Sentinel prioritizes:
-
-* Offline operation
-* Graceful degradation under failure
-* Modular architecture
-* Open-source development
-* Interoperability between communication systems
-* Support for both community and industrial emergency response
-
----
+Sentinel exists to keep critical alerts moving when normal infrastructure is degraded, overloaded, or unavailable. The current project focuses on local NOAA SAME decoding and mesh-first alert delivery, with optional integrations that must never weaken the primary offline-capable path.
 
 ## Current Capabilities
 
-### NOAA SAME Alert Monitoring
+* NOAA SAME/EAS decoding from stdin audio samples.
+* SAME county/location filtering with national alert override.
+* Test alert routing with optional `--test-channel`.
+* Required Meshtastic delivery through the Meshtastic Python CLI.
+* Optional Discord webhook delivery.
+* Optional best-effort failure spool for optional sender failures.
+* Synchronous sender/fan-out architecture.
 
-Sentinel receives NOAA Weather Radio broadcasts using an RTL-SDR and decodes SAME (Specific Area Message Encoding) alerts locally.
+Sentinel does not currently include Reticulum/LXMF, MeshCore, replay workers, dashboard, Skywarn ingestion, ATAK interoperability, CAP ingestion, or background processing.
 
-No internet connection is required.
+## Architecture Overview
 
-Supported alert types include:
-
-* Warnings
-* Watches
-* Statements
-* Civil emergency messages
-* National activations
-* Weekly/monthly test alerts
-
----
-
-### Meshtastic Integration (Required Sender)
-
-Sentinel forwards qualifying alerts to Meshtastic networks using the Meshtastic Python CLI.
-
-Features:
-
-* Serial node support
-* TCP node support
-* Configurable alert channel
-* Optional test alert channel
-* County/location filtering
-* National alert overrides
-
-Meshtastic remains Sentinel's primary delivery mechanism.
-
----
-
-### Discord Integration (Optional Sender)
-
-Sentinel can optionally forward alerts to Discord using webhook URLs.
-
-Features:
-
-* Optional configuration
-* Best-effort delivery
-* Does not interfere with Meshtastic operation
-* Discord failures do not prevent radio delivery
-
----
-
-### Failure Spooling (Optional)
-
-Sentinel can optionally record failed best-effort sender deliveries to a local spool file.
-
-Features:
-
-* Disabled by default
-* File-backed durability
-* No background worker required
-* Does not impact Meshtastic delivery
-
----
-
-## Architecture
-
-Sentinel follows an offline-first fan-out architecture.
-
-```text
-RTL-SDR
-    ↓
-NOAA SAME Decoder
-    ↓
-Filtering Engine
-    ↓
-Alert Model
-    ↓
-Fan-Out Engine
-     ├─ Meshtastic (required)
-     ├─ Discord (optional)
-     └─ Failure Spool (optional)
+```mermaid
+flowchart TD
+    A["RTL-SDR / NOAA Weather Radio audio"] --> B["rtl_fm"]
+    B --> C["Sentinel stdin audio input"]
+    C --> D["SAME decoder"]
+    D --> E["Alert channel and test routing"]
+    E --> F["County filter / national override"]
+    F --> G["Alert model and formatted message"]
+    G --> H["FanOut"]
+    H --> I["Required sender: Meshtastic"]
+    H --> J["Best-effort sender: Discord, if configured"]
+    J --> K["Optional failure spool, if configured"]
 ```
 
-Future integrations will extend this architecture without replacing it.
+Sentinel separates senders into two groups:
 
----
+* Required senders must succeed. Meshtastic is currently the only required sender.
+* Best-effort senders are optional. Discord is currently the only best-effort sender and is registered only when `--discord-webhook-url` is provided.
+
+The optional failure spool is enabled only with `--spool-path <PATH>`. It records failed best-effort sender attempts only. It is not a general alert journal and it does not currently replay failures.
+
+For more detail, see:
+
+* [Architecture](docs/ARCHITECTURE.md)
+* [Roadmap](docs/ROADMAP.md)
 
 ## Installation
 
-Installation instructions are currently focused on Raspberry Pi deployments using RTL-SDR and Meshtastic.
+Sentinel currently depends on the same operational inputs as the upstream alerter:
 
-Detailed setup documentation will continue to evolve as Sentinel expands.
+1. Install `rtl_fm`.
+   * On Raspberry Pi OS / Raspbian, the upstream guide references these instructions: <https://fuzzthepiguy.tech/rtl_fm-install/>
+2. Install the Meshtastic Python CLI.
+   * Meshtastic CLI installation: <https://meshtastic.org/docs/software/python/cli/installation/>
+3. Build or install Sentinel.
 
----
+From source:
+
+```sh
+cargo build --release
+```
+
+The executable name is inherited from the upstream package:
+
+```sh
+target/release/Meshtastic-SAME-EAS-Alerter --help
+```
+
+Release package names may still use the inherited upstream binary/package naming while Sentinel evolves.
 
 ## Usage
 
-### NOAA Monitoring Example
+Sentinel expects audio from `rtl_fm` on stdin. Tune `rtl_fm` to the nearest NOAA Weather Radio station, typically in the 162.400 MHz to 162.550 MHz range.
 
-```bash
-rtl_fm -f <FREQUENCY_HZ> -s 48000 -r 48000 | sentinel
+```sh
+rtl_fm -f <FREQUENCY_IN_HZ> -s 48000 -r 48000 | Meshtastic-SAME-EAS-Alerter
 ```
 
-### Discord Integration
+The frequency is provided to `rtl_fm` in Hz, not MHz.
 
-```bash
-rtl_fm -f <FREQUENCY_HZ> -s 48000 -r 48000 | sentinel \
-  --discord-webhook-url <WEBHOOK_URL>
+### Meshtastic
+
+By default, the Meshtastic CLI attempts to find a connected node via serial or localhost. You can also provide a TCP host or serial port.
+
+```sh
+Meshtastic-SAME-EAS-Alerter --host <TCP_HOST:PORT>
+Meshtastic-SAME-EAS-Alerter --port <SERIAL_PORT>
 ```
 
-### Failure Spool
+Alert channel:
 
-```bash
-rtl_fm -f <FREQUENCY_HZ> -s 48000 -r 48000 | sentinel \
-  --spool-path ./sentinel-spool.log
+```sh
+Meshtastic-SAME-EAS-Alerter --alert-channel <CHANNEL_NUMBER>
 ```
 
----
+If omitted, alert messages default to channel `0`.
 
-## Current CLI Options
+Test channel:
 
-* `--alert-channel`
-* `--test-channel`
-* `--host`
-* `--port`
-* `--rate`
-* `--locations`
-* `--discord-webhook-url`
-* `--spool-path`
-
-Run:
-
-```bash
-sentinel --help
+```sh
+Meshtastic-SAME-EAS-Alerter --test-channel <CHANNEL_NUMBER>
 ```
 
-for the latest options.
+If omitted, test alerts are ignored.
 
----
+### Sample Rate
 
-## Roadmap
+The default sample rate is `48000`.
 
-The Sentinel roadmap is maintained in:
-
-```text
-docs/ROADMAP.md
+```sh
+Meshtastic-SAME-EAS-Alerter --rate <SAMPLE_RATE>
 ```
 
-Planned capabilities include:
+Do not change this unless your audio pipeline requires it.
 
-* Reticulum / LXMF integration
-* MeshCore integration
-* Retry and replay workers
-* Incident Command dashboard
-* Skywarn ingestion
-* ATAK interoperability
+### Location Filtering
 
----
+Use `--locations` to send only alerts containing specific SAME location codes.
 
-## Legal
+```sh
+Meshtastic-SAME-EAS-Alerter --locations 006085,006087
+```
 
-Sentinel is an independent open-source project.
+If no locations are provided, non-national alerts are allowed. National alerts bypass the location filter. Location codes are listed in [src/sameCodes.csv](src/sameCodes.csv).
 
-This project is not endorsed by or affiliated with:
+### Optional Discord Webhook
 
-* Meshtastic LLC
-* The National Weather Service
-* FEMA
-* NOAA
+Discord delivery is disabled by default. It is enabled only when a webhook URL is provided.
 
-Meshtastic® is a registered trademark of Meshtastic LLC.
+```sh
+Meshtastic-SAME-EAS-Alerter --discord-webhook-url <DISCORD_WEBHOOK_URL>
+```
 
-Use at your own risk.
+Discord is best-effort. Discord failures are logged and do not block Meshtastic delivery. Sentinel does not log the full webhook URL.
 
----
+### Optional Best-Effort Failure Spool
 
-## Acknowledgements
+The failure spool is disabled by default. It is enabled only when a path is provided.
 
-Sentinel originated as a fork of:
+```sh
+Meshtastic-SAME-EAS-Alerter --spool-path <PATH>
+```
 
-RCGV1/Meshtastic-SAME-EAS-Alerter
+When enabled, Sentinel appends one-line JSONL-style records for failed best-effort sender attempts. Required Meshtastic failures are not spooled. Spool write failures do not block fan-out completion.
 
-We are grateful to the original authors and contributors whose work made Sentinel possible.
+### Full Examples
+
+Meshtastic only:
+
+```sh
+rtl_fm -f <FREQUENCY_IN_HZ> -s 48000 -r 48000 | Meshtastic-SAME-EAS-Alerter --alert-channel 0 --test-channel 1
+```
+
+Meshtastic over TCP:
+
+```sh
+rtl_fm -f <FREQUENCY_IN_HZ> -s 48000 -r 48000 | Meshtastic-SAME-EAS-Alerter --host <TCP_HOST:PORT> --alert-channel 0
+```
+
+Meshtastic with optional Discord and best-effort failure spool:
+
+```sh
+rtl_fm -f <FREQUENCY_IN_HZ> -s 48000 -r 48000 | Meshtastic-SAME-EAS-Alerter --alert-channel 0 --discord-webhook-url <DISCORD_WEBHOOK_URL> --spool-path sentinel-failures.jsonl
+```
+
+## Legal Disclaimer
+
+Sentinel is not an official emergency alerting system and is not a substitute for NOAA Weather Radio, Wireless Emergency Alerts, Emergency Alert System broadcasts, local emergency management instructions, or other official warning channels.
+
+Use Sentinel at your own risk. Operators are responsible for validating their hardware, radio coverage, alert routing, message delivery, and compliance with applicable laws, regulations, and organizational policies.
+
+This project is neither endorsed by nor supported by Meshtastic. Meshtastic is a registered trademark of Meshtastic LLC. NOAA, NWS, FEMA, EAS, Discord, and other names may be trademarks or service marks of their respective owners.
