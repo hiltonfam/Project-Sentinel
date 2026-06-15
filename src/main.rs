@@ -2,6 +2,7 @@ mod alert;
 mod discord_sender;
 mod meshtastic_sender;
 mod sender;
+mod spool;
 
 use alert::{
     alert_send_channel, format_alert_message, location_filter_allows, Alert, AlertMessageParts,
@@ -19,8 +20,10 @@ use sameold::{Message, SameReceiverBuilder, SignificanceLevel};
 use sender::{FanOut, Sender};
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
+use spool::FileSpooler;
 use std::collections::HashMap;
 use std::io::{self};
+use std::path::PathBuf;
 use strum::EnumMessage;
 
 #[derive(RustEmbed)]
@@ -123,6 +126,10 @@ struct Args {
     /// Optional Discord webhook URL for best-effort alert delivery
     #[arg(long)]
     discord_webhook_url: Option<String>,
+
+    /// Optional JSONL path for spooling best-effort sender failures
+    #[arg(long)]
+    spool_path: Option<PathBuf>,
 }
 
 fn build_fanout(args: &Args) -> FanOut {
@@ -133,12 +140,18 @@ fn build_fanout(args: &Args) -> FanOut {
         }))];
     let mut best_effort_senders: Vec<Box<dyn Sender>> = Vec::new();
 
-    if let Some(webhook_url) = &args.discord_webhook_url {
+    let mut fanout = if let Some(webhook_url) = &args.discord_webhook_url {
         best_effort_senders.push(Box::new(DiscordSender::new(webhook_url.clone())));
         FanOut::with_best_effort(required_senders, best_effort_senders)
     } else {
         FanOut::new(required_senders)
+    };
+
+    if let Some(spool_path) = &args.spool_path {
+        fanout = fanout.with_spooler(Box::new(FileSpooler::new(spool_path.clone())));
     }
+
+    fanout
 }
 
 fn main() -> Result<()> {
@@ -335,5 +348,23 @@ mod tests {
 
         assert_eq!(fanout.required_sender_count(), 1);
         assert_eq!(fanout.best_effort_sender_count(), 1);
+    }
+
+    #[test]
+    fn fanout_has_no_spooler_without_spool_path() {
+        let args = Args::try_parse_from(["alerter"]).unwrap();
+        let fanout = build_fanout(&args);
+
+        assert!(!fanout.has_spooler());
+    }
+
+    #[test]
+    fn fanout_configures_spooler_when_spool_path_is_provided() {
+        let args = Args::try_parse_from(["alerter", "--spool-path", "failed-sends.jsonl"]).unwrap();
+        let fanout = build_fanout(&args);
+
+        assert!(fanout.has_spooler());
+        assert_eq!(fanout.required_sender_count(), 1);
+        assert_eq!(fanout.best_effort_sender_count(), 0);
     }
 }

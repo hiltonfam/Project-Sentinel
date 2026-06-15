@@ -46,6 +46,10 @@ impl DiscordSender {
 }
 
 impl Sender for DiscordSender {
+    fn name(&self) -> &'static str {
+        "discord"
+    }
+
     fn check_ready(&self) -> Result<()> {
         Ok(())
     }
