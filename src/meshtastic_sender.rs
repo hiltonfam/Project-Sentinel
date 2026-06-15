@@ -1,9 +1,37 @@
 use crate::alert::{chunk_message, Alert};
 use crate::sender::Sender;
 use anyhow::{anyhow, Result};
+use std::io;
 use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+struct CommandOutput {
+    stdout: Vec<u8>,
+}
+
+trait CommandRunner {
+    fn output(&self, program: &str, args: &[String]) -> io::Result<CommandOutput>;
+    fn spawn(&self, program: &str, args: &[String]) -> io::Result<()>;
+}
+
+struct RealCommandRunner;
+
+impl CommandRunner for RealCommandRunner {
+    fn output(&self, program: &str, args: &[String]) -> io::Result<CommandOutput> {
+        Command::new(program)
+            .args(args)
+            .stdout(Stdio::piped())
+            .output()
+            .map(|output| CommandOutput {
+                stdout: output.stdout,
+            })
+    }
+
+    fn spawn(&self, program: &str, args: &[String]) -> io::Result<()> {
+        Command::new(program).args(args).spawn().map(|_| ())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshtasticConfig {
@@ -14,13 +42,19 @@ pub struct MeshtasticConfig {
 pub struct MeshtasticSender {
     config: MeshtasticConfig,
     last_message_time: Option<Instant>,
+    runner: Box<dyn CommandRunner>,
 }
 
 impl MeshtasticSender {
     pub fn new(config: MeshtasticConfig) -> Self {
+        Self::with_runner(config, Box::new(RealCommandRunner))
+    }
+
+    fn with_runner(config: MeshtasticConfig, runner: Box<dyn CommandRunner>) -> Self {
         Self {
             config,
             last_message_time: None,
+            runner,
         }
     }
 
@@ -80,9 +114,9 @@ impl MeshtasticSender {
         }
 
         for attempt in 0..=retries {
-            let result = Command::new("meshtastic")
-                .args(self.send_args(chan, message))
-                .spawn();
+            let result = self
+                .runner
+                .spawn("meshtastic", &self.send_args(chan, message));
 
             match result {
                 Ok(_) => {
@@ -107,10 +141,9 @@ impl MeshtasticSender {
 
 impl Sender for MeshtasticSender {
     fn check_ready(&self) -> Result<()> {
-        let output = Command::new("meshtastic")
-            .args(self.info_args())
-            .stdout(Stdio::piped())
-            .output()
+        let output = self
+            .runner
+            .output("meshtastic", &self.info_args())
             .map_err(|e| anyhow!("Failed to execute meshtastic --info: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -146,6 +179,41 @@ impl Sender for MeshtasticSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedCommand {
+        program: String,
+        args: Vec<String>,
+    }
+
+    struct RecordingCommandRunner {
+        commands: Rc<RefCell<Vec<RecordedCommand>>>,
+        stdout: Vec<u8>,
+    }
+
+    impl CommandRunner for RecordingCommandRunner {
+        fn output(&self, program: &str, args: &[String]) -> io::Result<CommandOutput> {
+            self.commands.borrow_mut().push(RecordedCommand {
+                program: program.to_string(),
+                args: args.to_vec(),
+            });
+
+            Ok(CommandOutput {
+                stdout: self.stdout.clone(),
+            })
+        }
+
+        fn spawn(&self, program: &str, args: &[String]) -> io::Result<()> {
+            self.commands.borrow_mut().push(RecordedCommand {
+                program: program.to_string(),
+                args: args.to_vec(),
+            });
+
+            Ok(())
+        }
+    }
 
     #[test]
     fn info_args_include_host_and_port_when_configured() {
@@ -209,6 +277,82 @@ mod tests {
                 "--port",
                 "/dev/ttyUSB0"
             ]
+        );
+    }
+
+    #[test]
+    fn check_ready_runs_meshtastic_info_without_real_cli() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let sender = MeshtasticSender::with_runner(
+            MeshtasticConfig {
+                host: Some("mesh.local:4403".to_string()),
+                port: None,
+            },
+            Box::new(RecordingCommandRunner {
+                commands: Rc::clone(&commands),
+                stdout: b"Connected to radio\n".to_vec(),
+            }),
+        );
+
+        sender.check_ready().unwrap();
+
+        assert_eq!(
+            *commands.borrow(),
+            vec![RecordedCommand {
+                program: "meshtastic".to_string(),
+                args: vec!["--host", "mesh.local:4403", "--info"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            }]
+        );
+    }
+
+    #[test]
+    fn send_alert_runs_meshtastic_send_without_real_cli() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let mut sender = MeshtasticSender::with_runner(
+            MeshtasticConfig {
+                host: None,
+                port: Some("/dev/ttyUSB0".to_string()),
+            },
+            Box::new(RecordingCommandRunner {
+                commands: Rc::clone(&commands),
+                stdout: Vec::new(),
+            }),
+        );
+        let alert = Alert::new(
+            "Tornado Warning".to_string(),
+            crate::alert::AlertSignificance::Warning,
+            "National Weather Service".to_string(),
+            "KXYZ".to_string(),
+            false,
+            vec!["006085".to_string()],
+            vec!["Central Santa Clara".to_string()],
+            "short alert".to_string(),
+        );
+
+        sender.send_alert(&alert, 3).unwrap();
+
+        assert_eq!(
+            *commands.borrow(),
+            vec![RecordedCommand {
+                program: "meshtastic".to_string(),
+                args: vec![
+                    "--no-nodes",
+                    "--no-time",
+                    "--ch-index",
+                    "3",
+                    "--sendtext",
+                    "short alert",
+                    "--ack",
+                    "--port",
+                    "/dev/ttyUSB0",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            }]
         );
     }
 }

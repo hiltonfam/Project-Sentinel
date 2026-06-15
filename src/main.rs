@@ -2,7 +2,10 @@ mod alert;
 mod meshtastic_sender;
 mod sender;
 
-use alert::{Alert, AlertSignificance};
+use alert::{
+    alert_send_channel, format_alert_message, location_filter_allows, Alert, AlertMessageParts,
+    AlertSignificance,
+};
 use anyhow::Result;
 use byteorder::{NativeEndian, ReadBytesExt};
 use clap::Parser;
@@ -202,63 +205,34 @@ fn main() -> Result<()> {
         match msg {
             Message::StartOfMessage(hdr) => {
                 let evt = hdr.event();
+                let significance = alert_significance(evt.significance());
                 log::info!("Begin SAME voice message: {:?}", hdr);
-                let mut message: String;
-                let mut send_channel: u32 = alert_channel;
                 let codes: Vec<String> = hdr.location_str_iter().map(|s| s.to_string()).collect();
                 let mut locations_found = Vec::new();
 
-                message =
-                    ", Issued By: ".to_string() + hdr.originator().get_detailed_message().unwrap();
-                match evt.significance() {
-                    SignificanceLevel::Test => {
-                        send_channel = test_channel;
-                        if test_channel == 10 {
-                            log::info!("Ignoring test alert");
-                            continue;
-                        }
-                        message = "📖Received ".to_string()
-                            + &evt.to_string()
-                            + " from "
-                            + hdr.callsign()
-                            + &*message;
-                    }
-                    SignificanceLevel::Statement => {
-                        message = "📟".to_string() + &evt.to_string() + &*message;
-                    }
-                    SignificanceLevel::Emergency => {
-                        message = "🚨".to_string() + &evt.to_string() + &*message;
-                    }
-                    SignificanceLevel::Watch => {
-                        message = "⚠️".to_string() + &evt.to_string() + &*message;
-                    }
-                    SignificanceLevel::Warning => {
-                        message = "🚨".to_string() + &evt.to_string() + &*message;
-                    }
-                    SignificanceLevel::Unknown => {
-                        message = "🚨".to_string() + &evt.to_string() + &*message;
-                    }
-                }
+                let Some(send_channel) =
+                    alert_send_channel(significance, alert_channel, test_channel)
+                else {
+                    log::info!("Ignoring test alert");
+                    continue;
+                };
 
-                if hdr.is_national() {
-                    message += " Nationwide Alert"
-                } else {
+                if !hdr.is_national() {
                     if !args.locations.is_empty() && !codes.is_empty() {
                         // Log the values for debugging
                         log::debug!("Provided locations: {:?}", args.locations);
                         log::debug!("Alert locations: {:?}", codes);
 
-                        let has_match = codes.iter().any(|code| {
+                        for code in &codes {
                             let matches = args.locations.contains(code);
                             log::debug!(
                                 "Comparing alert code '{}' with provided locations: {}",
                                 code,
                                 matches
                             );
-                            matches
-                        });
+                        }
 
-                        if !has_match {
+                        if !location_filter_allows(hdr.is_national(), &args.locations, &codes) {
                             log::info!("Ignoring alert with no matching locations in filter");
                             continue;
                         } else {
@@ -278,22 +252,22 @@ fn main() -> Result<()> {
                             log::debug!("Location Code: {} not found", code);
                         }
                     }
-
-                    if !locations_found.is_empty() {
-                        if locations_found.len() == 1 {
-                            message.push_str(", Location: ");
-                        } else {
-                            message.push_str(", Locations: ");
-                        }
-                        message.push_str(&locations_found.join(", "));
-                    }
                 }
+
+                let message = format_alert_message(AlertMessageParts {
+                    event: &evt.to_string(),
+                    significance,
+                    originator: hdr.originator().get_detailed_message().unwrap(),
+                    callsign: hdr.callsign(),
+                    is_national: hdr.is_national(),
+                    location_names: &locations_found,
+                });
 
                 log::info!("Attempting to send message over the mesh: {}", message);
 
                 let alert = Alert::new(
                     evt.to_string(),
-                    alert_significance(evt.significance()),
+                    significance,
                     hdr.originator().get_detailed_message().unwrap().to_string(),
                     hdr.callsign().to_string(),
                     hdr.is_national(),
