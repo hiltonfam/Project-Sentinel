@@ -1,4 +1,5 @@
 mod alert;
+mod discord_sender;
 mod meshtastic_sender;
 mod sender;
 
@@ -10,11 +11,12 @@ use anyhow::Result;
 use byteorder::{NativeEndian, ReadBytesExt};
 use clap::Parser;
 use csv::ReaderBuilder;
+use discord_sender::DiscordSender;
 use log::LevelFilter;
 use meshtastic_sender::{MeshtasticConfig, MeshtasticSender};
 use rust_embed::RustEmbed;
 use sameold::{Message, SameReceiverBuilder, SignificanceLevel};
-use sender::FanOut;
+use sender::{FanOut, Sender};
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
 use std::collections::HashMap;
@@ -117,6 +119,26 @@ struct Args {
     /// Location codes that must be present to send an alert
     #[arg(long, short, value_delimiter = ',', default_value = None, required = false)]
     locations: Vec<String>,
+
+    /// Optional Discord webhook URL for best-effort alert delivery
+    #[arg(long)]
+    discord_webhook_url: Option<String>,
+}
+
+fn build_fanout(args: &Args) -> FanOut {
+    let required_senders: Vec<Box<dyn Sender>> =
+        vec![Box::new(MeshtasticSender::new(MeshtasticConfig {
+            host: args.host.clone(),
+            port: args.port.clone(),
+        }))];
+    let mut best_effort_senders: Vec<Box<dyn Sender>> = Vec::new();
+
+    if let Some(webhook_url) = &args.discord_webhook_url {
+        best_effort_senders.push(Box::new(DiscordSender::new(webhook_url.clone())));
+        FanOut::with_best_effort(required_senders, best_effort_senders)
+    } else {
+        FanOut::new(required_senders)
+    }
 }
 
 fn main() -> Result<()> {
@@ -157,10 +179,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut fanout = FanOut::new(vec![Box::new(MeshtasticSender::new(MeshtasticConfig {
-        host: args.host.clone(),
-        port: args.port.clone(),
-    }))]);
+    let mut fanout = build_fanout(&args);
 
     if let Err(e) = fanout.check_ready() {
         log::error!("{}", e);
@@ -289,4 +308,32 @@ fn main() -> Result<()> {
     log::warn!("Program stopped, no longer monitoring");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fanout_registers_only_meshtastic_without_discord_webhook() {
+        let args = Args::try_parse_from(["alerter"]).unwrap();
+        let fanout = build_fanout(&args);
+
+        assert_eq!(fanout.required_sender_count(), 1);
+        assert_eq!(fanout.best_effort_sender_count(), 0);
+    }
+
+    #[test]
+    fn fanout_registers_discord_as_best_effort_when_webhook_is_provided() {
+        let args = Args::try_parse_from([
+            "alerter",
+            "--discord-webhook-url",
+            "https://discord.example/webhook",
+        ])
+        .unwrap();
+        let fanout = build_fanout(&args);
+
+        assert_eq!(fanout.required_sender_count(), 1);
+        assert_eq!(fanout.best_effort_sender_count(), 1);
+    }
 }
