@@ -3,6 +3,7 @@ mod discord_sender;
 mod lxmf_sender;
 mod meshcore_sender;
 mod meshtastic_sender;
+mod replay;
 mod sender;
 mod spool;
 
@@ -19,6 +20,7 @@ use log::LevelFilter;
 use lxmf_sender::{LxmfConfig, LxmfSender};
 use meshcore_sender::{MeshCoreConfig, MeshCoreSender};
 use meshtastic_sender::{MeshtasticConfig, MeshtasticSender};
+use replay::replay_spool_file;
 use rust_embed::RustEmbed;
 use sameold::{Message, SameReceiverBuilder, SignificanceLevel};
 use sender::{FanOut, Sender};
@@ -158,14 +160,17 @@ struct Args {
     /// Optional MeshCore helper configuration path
     #[arg(long)]
     meshcore_config: Option<PathBuf>,
+
+    /// Run one-shot replay for best-effort sender failures from this spool path, then exit
+    #[arg(long)]
+    replay_spool: Option<PathBuf>,
+
+    /// Optional path for records that fail during one-shot replay
+    #[arg(long)]
+    replay_failed_output: Option<PathBuf>,
 }
 
-fn build_fanout(args: &Args) -> Result<FanOut> {
-    let required_senders: Vec<Box<dyn Sender>> =
-        vec![Box::new(MeshtasticSender::new(MeshtasticConfig {
-            host: args.host.clone(),
-            port: args.port.clone(),
-        }))];
+fn build_best_effort_senders(args: &Args) -> Result<Vec<Box<dyn Sender>>> {
     let mut best_effort_senders: Vec<Box<dyn Sender>> = Vec::new();
 
     if let Some(webhook_url) = &args.discord_webhook_url {
@@ -226,6 +231,17 @@ fn build_fanout(args: &Args) -> Result<FanOut> {
         }
     }
 
+    Ok(best_effort_senders)
+}
+
+fn build_fanout(args: &Args) -> Result<FanOut> {
+    let required_senders: Vec<Box<dyn Sender>> =
+        vec![Box::new(MeshtasticSender::new(MeshtasticConfig {
+            host: args.host.clone(),
+            port: args.port.clone(),
+        }))];
+    let best_effort_senders = build_best_effort_senders(args)?;
+
     let mut fanout = if best_effort_senders.is_empty() {
         FanOut::new(required_senders)
     } else {
@@ -237,6 +253,35 @@ fn build_fanout(args: &Args) -> Result<FanOut> {
     }
 
     Ok(fanout)
+}
+
+fn replay_mode_enabled(args: &Args) -> bool {
+    args.replay_spool.is_some()
+}
+
+fn run_replay_mode(args: &Args) -> Result<()> {
+    let Some(replay_spool) = &args.replay_spool else {
+        return Ok(());
+    };
+
+    let summary = replay_spool_file(
+        replay_spool,
+        build_best_effort_senders(args)?,
+        args.replay_failed_output.as_deref(),
+    )?;
+
+    log::info!(
+        "Replay complete: parsed={}, replayed={}, failed={}, malformed={}, skipped_meshtastic={}, skipped_unconfigured={}, skipped_unknown={}",
+        summary.parsed_records,
+        summary.replayed_records,
+        summary.failed_records,
+        summary.malformed_lines,
+        summary.skipped_meshtastic_records,
+        summary.skipped_unconfigured_records,
+        summary.skipped_unknown_sender_records
+    );
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -256,6 +301,10 @@ fn main() -> Result<()> {
 
     // Parse the command line arguments
     let args = Args::parse();
+
+    if replay_mode_enabled(&args) {
+        return run_replay_mode(&args);
+    }
 
     // Handle alertChannel argument
     if let Some(alert_channel_arg) = args.alert_channel {
@@ -433,6 +482,20 @@ mod tests {
 
         assert_eq!(fanout.required_sender_count(), 1);
         assert_eq!(fanout.best_effort_sender_count(), 1);
+    }
+
+    #[test]
+    fn replay_mode_is_disabled_without_replay_spool() {
+        let args = Args::try_parse_from(["alerter"]).unwrap();
+
+        assert!(!replay_mode_enabled(&args));
+    }
+
+    #[test]
+    fn replay_mode_is_enabled_with_replay_spool() {
+        let args = Args::try_parse_from(["alerter", "--replay-spool", "failures.jsonl"]).unwrap();
+
+        assert!(replay_mode_enabled(&args));
     }
 
     #[test]
