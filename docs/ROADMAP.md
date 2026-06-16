@@ -6,14 +6,17 @@
 * [x] Phase 1.1 - Hardening and regression testing
 * [x] Phase 2 - Optional Discord sender
 * [x] Phase 2.1 - Optional best-effort failure spool
+* [x] Phase 2.2 - Documentation rebrand
+* [x] Phase 3 - Reticulum LXMF sender
+* [x] Phase 4 - MeshCore sender
+* [x] Phase 4.1 - PR automation safety rails
+* [x] Phase 5 - Manual replay for spooled failures
 
 ---
 
 ## Planned
 
-* [ ] Phase 3 - Reticulum LXMF sender
-* [ ] Phase 4 - MeshCore sender
-* [ ] Phase 5 - Replay worker for spooled failures
+* [ ] Phase 5.1 - Documentation update
 * [ ] Phase 6 - Incident Command dashboard foundation
 * [ ] Phase 7 - Skywarn ingestion pipeline
 * [ ] Phase 8 - ATAK interoperability
