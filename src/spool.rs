@@ -1,5 +1,6 @@
 use crate::alert::{Alert, AlertSignificance};
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -30,7 +31,7 @@ impl Spooler for FileSpooler {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SpoolRecord {
     pub timestamp_unix_secs: u64,
     pub sender: String,
@@ -86,50 +87,25 @@ impl SpoolRecord {
     }
 
     pub fn to_json_line(&self) -> String {
-        format!(
-            "{{\"timestamp_unix_secs\":{},\"sender\":\"{}\",\"channel\":{},\"error\":\"{}\",\"event\":\"{}\",\"significance\":\"{:?}\",\"originator\":\"{}\",\"callsign\":\"{}\",\"is_national\":{},\"is_test\":{},\"location_codes\":{},\"location_names\":{},\"message_text\":\"{}\"}}",
-            self.timestamp_unix_secs,
-            json_escape(&self.sender),
-            self.channel,
-            json_escape(&self.error),
-            json_escape(&self.event),
+        serde_json::to_string(self).expect("spool record serialization should not fail")
+    }
+
+    pub fn from_json_line(line: &str) -> Result<Self> {
+        serde_json::from_str(line).context("invalid spool record JSON")
+    }
+
+    pub fn to_alert(&self) -> Alert {
+        Alert::new(
+            self.event.clone(),
             self.significance,
-            json_escape(&self.originator),
-            json_escape(&self.callsign),
+            self.originator.clone(),
+            self.callsign.clone(),
             self.is_national,
-            self.is_test,
-            json_string_array(&self.location_codes),
-            json_string_array(&self.location_names),
-            json_escape(&self.message_text),
+            self.location_codes.clone(),
+            self.location_names.clone(),
+            self.message_text.clone(),
         )
     }
-}
-
-fn json_string_array(values: &[String]) -> String {
-    let values = values
-        .iter()
-        .map(|value| format!("\"{}\"", json_escape(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{}]", values)
-}
-
-fn json_escape(value: &str) -> String {
-    let mut escaped = String::new();
-
-    for ch in value.chars() {
-        match ch {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            c if c.is_control() => escaped.push_str(&format!("\\u{:04x}", c as u32)),
-            c => escaped.push(c),
-        }
-    }
-
-    escaped
 }
 
 #[cfg(test)]
@@ -167,6 +143,22 @@ mod tests {
             "{\"timestamp_unix_secs\":123,\"sender\":\"discord\",\"channel\":2,\"error\":\"failed \\\"badly\\\"\\nwithout url\",\"event\":\"Tornado Warning\",\"significance\":\"Warning\",\"originator\":\"National Weather Service\",\"callsign\":\"KXYZ\",\"is_national\":false,\"is_test\":false,\"location_codes\":[\"006085\"],\"location_names\":[\"Central Santa Clara\"],\"message_text\":\"line 1\\n\\\"quoted\\\" \\\\ path\"}"
         );
         assert!(!record.to_json_line().contains('\n'));
+    }
+
+    #[test]
+    fn spool_record_parses_from_json_line() {
+        let alert = test_alert("alert text".to_string());
+        let record = SpoolRecord::from_failure_at("discord", &alert, 0, "failed", 456);
+
+        assert_eq!(
+            SpoolRecord::from_json_line(&record.to_json_line()).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn malformed_spool_record_returns_error() {
+        assert!(SpoolRecord::from_json_line("not json").is_err());
     }
 
     #[test]

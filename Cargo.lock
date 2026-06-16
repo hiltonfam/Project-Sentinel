@@ -18,6 +18,7 @@ dependencies = [
  "rust-embed",
  "sameold",
  "serde",
+ "serde_json",
  "simple_logger",
  "strum",
  "thiserror 1.0.69",
