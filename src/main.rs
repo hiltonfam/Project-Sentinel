@@ -1,5 +1,6 @@
 mod alert;
 mod discord_sender;
+mod lxmf_sender;
 mod meshtastic_sender;
 mod sender;
 mod spool;
@@ -14,6 +15,7 @@ use clap::Parser;
 use csv::ReaderBuilder;
 use discord_sender::DiscordSender;
 use log::LevelFilter;
+use lxmf_sender::{LxmfConfig, LxmfSender};
 use meshtastic_sender::{MeshtasticConfig, MeshtasticSender};
 use rust_embed::RustEmbed;
 use sameold::{Message, SameReceiverBuilder, SignificanceLevel};
@@ -130,9 +132,21 @@ struct Args {
     /// Optional JSONL path for spooling best-effort sender failures
     #[arg(long)]
     spool_path: Option<PathBuf>,
+
+    /// Optional LXMF send helper command for best-effort alert delivery
+    #[arg(long)]
+    lxmf_command: Option<PathBuf>,
+
+    /// Optional LXMF destination for best-effort alert delivery
+    #[arg(long)]
+    lxmf_destination: Option<String>,
+
+    /// Optional LXMF helper configuration path
+    #[arg(long)]
+    lxmf_config: Option<PathBuf>,
 }
 
-fn build_fanout(args: &Args) -> FanOut {
+fn build_fanout(args: &Args) -> Result<FanOut> {
     let required_senders: Vec<Box<dyn Sender>> =
         vec![Box::new(MeshtasticSender::new(MeshtasticConfig {
             host: args.host.clone(),
@@ -140,18 +154,48 @@ fn build_fanout(args: &Args) -> FanOut {
         }))];
     let mut best_effort_senders: Vec<Box<dyn Sender>> = Vec::new();
 
-    let mut fanout = if let Some(webhook_url) = &args.discord_webhook_url {
+    if let Some(webhook_url) = &args.discord_webhook_url {
         best_effort_senders.push(Box::new(DiscordSender::new(webhook_url.clone())));
-        FanOut::with_best_effort(required_senders, best_effort_senders)
-    } else {
+    }
+
+    match (&args.lxmf_command, &args.lxmf_destination) {
+        (Some(command), Some(destination)) => {
+            best_effort_senders.push(Box::new(LxmfSender::new(LxmfConfig {
+                command: command.clone(),
+                destination: destination.clone(),
+                config: args.lxmf_config.clone(),
+            })));
+        }
+        (None, None) => {
+            if args.lxmf_config.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--lxmf-config requires --lxmf-command and --lxmf-destination"
+                ));
+            }
+        }
+        (Some(_), None) => {
+            return Err(anyhow::anyhow!(
+                "--lxmf-command requires --lxmf-destination"
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(anyhow::anyhow!(
+                "--lxmf-destination requires --lxmf-command"
+            ));
+        }
+    }
+
+    let mut fanout = if best_effort_senders.is_empty() {
         FanOut::new(required_senders)
+    } else {
+        FanOut::with_best_effort(required_senders, best_effort_senders)
     };
 
     if let Some(spool_path) = &args.spool_path {
         fanout = fanout.with_spooler(Box::new(FileSpooler::new(spool_path.clone())));
     }
 
-    fanout
+    Ok(fanout)
 }
 
 fn main() -> Result<()> {
@@ -192,7 +236,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut fanout = build_fanout(&args);
+    let mut fanout = build_fanout(&args)?;
 
     if let Err(e) = fanout.check_ready() {
         log::error!("{}", e);
@@ -330,7 +374,7 @@ mod tests {
     #[test]
     fn fanout_registers_only_meshtastic_without_discord_webhook() {
         let args = Args::try_parse_from(["alerter"]).unwrap();
-        let fanout = build_fanout(&args);
+        let fanout = build_fanout(&args).unwrap();
 
         assert_eq!(fanout.required_sender_count(), 1);
         assert_eq!(fanout.best_effort_sender_count(), 0);
@@ -344,7 +388,7 @@ mod tests {
             "https://discord.example/webhook",
         ])
         .unwrap();
-        let fanout = build_fanout(&args);
+        let fanout = build_fanout(&args).unwrap();
 
         assert_eq!(fanout.required_sender_count(), 1);
         assert_eq!(fanout.best_effort_sender_count(), 1);
@@ -353,7 +397,7 @@ mod tests {
     #[test]
     fn fanout_has_no_spooler_without_spool_path() {
         let args = Args::try_parse_from(["alerter"]).unwrap();
-        let fanout = build_fanout(&args);
+        let fanout = build_fanout(&args).unwrap();
 
         assert!(!fanout.has_spooler());
     }
@@ -361,10 +405,77 @@ mod tests {
     #[test]
     fn fanout_configures_spooler_when_spool_path_is_provided() {
         let args = Args::try_parse_from(["alerter", "--spool-path", "failed-sends.jsonl"]).unwrap();
-        let fanout = build_fanout(&args);
+        let fanout = build_fanout(&args).unwrap();
 
         assert!(fanout.has_spooler());
         assert_eq!(fanout.required_sender_count(), 1);
         assert_eq!(fanout.best_effort_sender_count(), 0);
+    }
+
+    #[test]
+    fn fanout_registers_no_lxmf_sender_without_lxmf_flags() {
+        let args = Args::try_parse_from(["alerter"]).unwrap();
+        let fanout = build_fanout(&args).unwrap();
+
+        assert_eq!(fanout.required_sender_count(), 1);
+        assert_eq!(fanout.best_effort_sender_count(), 0);
+    }
+
+    #[test]
+    fn fanout_registers_lxmf_as_best_effort_when_required_flags_are_provided() {
+        let args = Args::try_parse_from([
+            "alerter",
+            "--lxmf-command",
+            "lxmf-send",
+            "--lxmf-destination",
+            "dest-123",
+        ])
+        .unwrap();
+        let fanout = build_fanout(&args).unwrap();
+
+        assert_eq!(fanout.required_sender_count(), 1);
+        assert_eq!(fanout.best_effort_sender_count(), 1);
+    }
+
+    #[test]
+    fn fanout_registers_discord_and_lxmf_as_best_effort_when_both_are_configured() {
+        let args = Args::try_parse_from([
+            "alerter",
+            "--discord-webhook-url",
+            "https://discord.example/webhook",
+            "--lxmf-command",
+            "lxmf-send",
+            "--lxmf-destination",
+            "dest-123",
+        ])
+        .unwrap();
+        let fanout = build_fanout(&args).unwrap();
+
+        assert_eq!(fanout.required_sender_count(), 1);
+        assert_eq!(fanout.best_effort_sender_count(), 2);
+    }
+
+    #[test]
+    fn partial_lxmf_config_returns_clear_error() {
+        let command_only =
+            Args::try_parse_from(["alerter", "--lxmf-command", "lxmf-send"]).unwrap();
+        assert_eq!(
+            build_fanout(&command_only).err().unwrap().to_string(),
+            "--lxmf-command requires --lxmf-destination"
+        );
+
+        let destination_only =
+            Args::try_parse_from(["alerter", "--lxmf-destination", "dest-123"]).unwrap();
+        assert_eq!(
+            build_fanout(&destination_only).err().unwrap().to_string(),
+            "--lxmf-destination requires --lxmf-command"
+        );
+
+        let config_only =
+            Args::try_parse_from(["alerter", "--lxmf-config", "reticulum-config"]).unwrap();
+        assert_eq!(
+            build_fanout(&config_only).err().unwrap().to_string(),
+            "--lxmf-config requires --lxmf-command and --lxmf-destination"
+        );
     }
 }
