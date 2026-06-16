@@ -2,7 +2,7 @@
 
 Project Sentinel is an offline-first NOAA SAME/EAS alert relay for resilient emergency communications. It decodes NOAA Weather Radio SAME alerts from an SDR audio stream, applies local routing and county filtering rules, and sends alert text to a Meshtastic mesh as the required primary delivery path.
 
-Sentinel extends the upstream [RCGV1/Meshtastic-SAME-EAS-Alerter](https://github.com/RCGV1/Meshtastic-SAME-EAS-Alerter) project. The upstream project provided the foundation for SAME decoding, county filtering, alert formatting, and Meshtastic CLI delivery. Sentinel preserves that behavior while adding a synchronous sender/fan-out architecture, an optional Discord webhook sender, and an optional best-effort failure spool.
+Sentinel extends the upstream [RCGV1/Meshtastic-SAME-EAS-Alerter](https://github.com/RCGV1/Meshtastic-SAME-EAS-Alerter) project. The upstream project provided the foundation for SAME decoding, county filtering, alert formatting, and Meshtastic CLI delivery. Sentinel preserves that behavior while adding a synchronous sender/fan-out architecture, optional best-effort senders, an optional best-effort failure spool, and manual replay for spooled best-effort failures.
 
 ## Mission
 
@@ -15,10 +15,13 @@ Sentinel exists to keep critical alerts moving when normal infrastructure is deg
 * Test alert routing with optional `--test-channel`.
 * Required Meshtastic delivery through the Meshtastic Python CLI.
 * Optional Discord webhook delivery.
+* Optional Reticulum/LXMF helper delivery.
+* Optional MeshCore helper delivery.
 * Optional best-effort failure spool for optional sender failures.
+* One-shot manual replay of spooled best-effort failures.
 * Synchronous sender/fan-out architecture.
 
-Sentinel does not currently include Reticulum/LXMF, MeshCore, replay workers, dashboard, Skywarn ingestion, ATAK interoperability, CAP ingestion, or background processing.
+Sentinel does not currently include a native Reticulum/LXMF protocol implementation, a native MeshCore protocol implementation, dashboard, Skywarn ingestion, ATAK interoperability, CAP ingestion, scheduler, daemon, async runtime, or background processing.
 
 ## Architecture Overview
 
@@ -33,15 +36,21 @@ flowchart TD
     G --> H["FanOut"]
     H --> I["Required sender: Meshtastic"]
     H --> J["Best-effort sender: Discord, if configured"]
-    J --> K["Optional failure spool, if configured"]
+    H --> K["Best-effort sender: LXMF helper, if configured"]
+    H --> L["Best-effort sender: MeshCore helper, if configured"]
+    J --> M["Optional failure spool, if configured"]
+    K --> M
+    L --> M
 ```
 
 Sentinel separates senders into two groups:
 
 * Required senders must succeed. Meshtastic is currently the only required sender.
-* Best-effort senders are optional. Discord is currently the only best-effort sender and is registered only when `--discord-webhook-url` is provided.
+* Best-effort senders are optional. Discord, LXMF, and MeshCore are registered only when their required configuration flags are provided.
 
-The optional failure spool is enabled only with `--spool-path <PATH>`. It records failed best-effort sender attempts only. It is not a general alert journal and it does not currently replay failures.
+The optional failure spool is enabled only with `--spool-path <PATH>`. It records failed best-effort sender attempts only. It is not a general alert journal.
+
+Manual replay mode is enabled only with `--replay-spool <PATH>`. It reads an existing spool file and retries configured best-effort senders once, then exits. Meshtastic records are never replayed.
 
 For more detail, see:
 
@@ -137,6 +146,50 @@ Meshtastic-SAME-EAS-Alerter --discord-webhook-url <DISCORD_WEBHOOK_URL>
 
 Discord is best-effort. Discord failures are logged and do not block Meshtastic delivery. Sentinel does not log the full webhook URL.
 
+### Optional Reticulum/LXMF Helper
+
+LXMF delivery is disabled by default. It is enabled only when both a helper command and destination are provided.
+
+```sh
+Meshtastic-SAME-EAS-Alerter --lxmf-command <LXMF_HELPER_PATH> --lxmf-destination <LXMF_DESTINATION>
+```
+
+An optional helper configuration path can also be passed:
+
+```sh
+Meshtastic-SAME-EAS-Alerter --lxmf-command <LXMF_HELPER_PATH> --lxmf-destination <LXMF_DESTINATION> --lxmf-config <CONFIG_PATH>
+```
+
+Sentinel runs the helper as:
+
+```text
+<lxmf-command> --destination <destination> [--config <config>]
+```
+
+The alert message body is written to the helper over stdin. LXMF is best-effort; failures are logged, may be spooled when `--spool-path` is configured, and do not block Meshtastic delivery.
+
+### Optional MeshCore Helper
+
+MeshCore delivery is disabled by default. It is enabled only when both a helper command and destination are provided.
+
+```sh
+Meshtastic-SAME-EAS-Alerter --meshcore-command <MESHCORE_HELPER_PATH> --meshcore-destination <MESHCORE_DESTINATION>
+```
+
+An optional helper configuration path can also be passed:
+
+```sh
+Meshtastic-SAME-EAS-Alerter --meshcore-command <MESHCORE_HELPER_PATH> --meshcore-destination <MESHCORE_DESTINATION> --meshcore-config <CONFIG_PATH>
+```
+
+Sentinel runs the helper as:
+
+```text
+<meshcore-command> --destination <destination> [--config <config>]
+```
+
+The alert message body is written to the helper over stdin. MeshCore is best-effort; failures are logged, may be spooled when `--spool-path` is configured, and do not block Meshtastic delivery.
+
 ### Optional Best-Effort Failure Spool
 
 The failure spool is disabled by default. It is enabled only when a path is provided.
@@ -146,6 +199,24 @@ Meshtastic-SAME-EAS-Alerter --spool-path <PATH>
 ```
 
 When enabled, Sentinel appends one-line JSONL-style records for failed best-effort sender attempts. Required Meshtastic failures are not spooled. Spool write failures do not block fan-out completion.
+
+### Manual Replay Mode
+
+Manual replay mode retries spooled best-effort failures once and then exits. It is disabled unless `--replay-spool <PATH>` is provided.
+
+```sh
+Meshtastic-SAME-EAS-Alerter --replay-spool <SPOOL_PATH> --discord-webhook-url <DISCORD_WEBHOOK_URL>
+```
+
+Replay targets only best-effort sender records for `discord`, `lxmf`, and `meshcore`. A matching sender must be configured for a record to be replayed. Meshtastic records are skipped and are never replayed.
+
+Use `--replay-failed-output <PATH>` to write records that still fail during replay:
+
+```sh
+Meshtastic-SAME-EAS-Alerter --replay-spool <SPOOL_PATH> --replay-failed-output <FAILED_OUTPUT_PATH> --discord-webhook-url <DISCORD_WEBHOOK_URL>
+```
+
+The source spool is read-only during replay. Replay failures are logged and do not stop later records from being attempted.
 
 ### Full Examples
 
@@ -165,6 +236,18 @@ Meshtastic with optional Discord and best-effort failure spool:
 
 ```sh
 rtl_fm -f <FREQUENCY_IN_HZ> -s 48000 -r 48000 | Meshtastic-SAME-EAS-Alerter --alert-channel 0 --discord-webhook-url <DISCORD_WEBHOOK_URL> --spool-path sentinel-failures.jsonl
+```
+
+Meshtastic with all current optional best-effort senders:
+
+```sh
+rtl_fm -f <FREQUENCY_IN_HZ> -s 48000 -r 48000 | Meshtastic-SAME-EAS-Alerter --alert-channel 0 --discord-webhook-url <DISCORD_WEBHOOK_URL> --lxmf-command <LXMF_HELPER_PATH> --lxmf-destination <LXMF_DESTINATION> --meshcore-command <MESHCORE_HELPER_PATH> --meshcore-destination <MESHCORE_DESTINATION> --spool-path sentinel-failures.jsonl
+```
+
+Replay spooled best-effort failures:
+
+```sh
+Meshtastic-SAME-EAS-Alerter --replay-spool sentinel-failures.jsonl --replay-failed-output sentinel-replay-failed.jsonl --discord-webhook-url <DISCORD_WEBHOOK_URL>
 ```
 
 ## Legal Disclaimer

@@ -2,7 +2,7 @@
 
 ## Mission
 
-Sentinel turns NOAA SAME/EAS alerts into resilient, operator-focused messages for off-grid and degraded-infrastructure communications. The current system preserves the upstream Meshtastic alerting behavior while extending it into a modular sender architecture.
+Sentinel turns NOAA SAME/EAS alerts into resilient, operator-focused messages for off-grid and degraded-infrastructure communications. The current system preserves the upstream Meshtastic alerting behavior while extending it into a modular sender architecture with optional best-effort integrations and manual replay for spooled best-effort failures.
 
 ## Offline-First Philosophy
 
@@ -41,6 +41,8 @@ flowchart TD
     N --> O["FanOut send_alert"]
 ```
 
+Normal monitoring mode is the default. Replay mode is a separate one-shot path enabled only with `--replay-spool <PATH>`.
+
 ## SAME Decoding Flow
 
 The decoding path remains the upstream-derived behavior:
@@ -75,11 +77,15 @@ flowchart LR
     B --> D["Best-effort senders"]
     C --> E["MeshtasticSender"]
     D --> F["DiscordSender, if configured"]
-    F --> G{"Failure?"}
-    G -->|yes, spool enabled| H["Append best-effort failure record"]
-    G -->|yes, no spool| I["Log and continue"]
-    E --> J{"Failure?"}
-    J -->|yes| K["Return failure"]
+    D --> G["LxmfSender helper, if configured"]
+    D --> H["MeshCoreSender helper, if configured"]
+    F --> I{"Failure?"}
+    G --> I
+    H --> I
+    I -->|yes, spool enabled| J["Append best-effort failure record"]
+    I -->|yes, no spool| K["Log and continue"]
+    E --> L{"Failure?"}
+    L -->|yes| M["Return failure"]
 ```
 
 Required senders are part of the primary delivery path. If a required sender fails, fan-out returns an error. Best-effort senders are optional; their failures are logged and do not block required delivery.
@@ -119,6 +125,32 @@ Current responsibilities:
 
 Discord is network-dependent and is not part of Sentinel's offline-first primary path.
 
+## Reticulum/LXMF Role
+
+Reticulum/LXMF is an optional best-effort sender implemented through an external helper command. Sentinel does not implement the native Reticulum or LXMF protocol.
+
+Current responsibilities:
+
+* Register only when both `--lxmf-command` and `--lxmf-destination` are provided.
+* Pass the destination and optional `--lxmf-config` path as deterministic command arguments.
+* Write the alert message body to the helper over stdin.
+* Fail without blocking Meshtastic delivery.
+
+LXMF failures may be spooled when `--spool-path` is configured.
+
+## MeshCore Role
+
+MeshCore is an optional best-effort sender implemented through an external helper command. Sentinel does not implement the native MeshCore protocol.
+
+Current responsibilities:
+
+* Register only when both `--meshcore-command` and `--meshcore-destination` are provided.
+* Pass the destination and optional `--meshcore-config` path as deterministic command arguments.
+* Write the alert message body to the helper over stdin.
+* Fail without blocking Meshtastic delivery.
+
+MeshCore failures may be spooled when `--spool-path` is configured.
+
 ## Failure Spool Role
 
 The failure spool is an opt-in durability aid for best-effort sender failures.
@@ -132,7 +164,55 @@ Current behavior:
 * Does not spool required Meshtastic failures.
 * Spool write failures are logged and do not block fan-out completion.
 
-The spool is not currently a replay queue, alert journal, or incident log.
+The spool is not a general alert journal or incident log. It is the input format for manual replay.
+
+## Manual Replay Role
+
+Manual replay is a one-shot operator action for retrying spooled best-effort failures. It is enabled only with `--replay-spool <PATH>` and exits after processing the source file.
+
+```mermaid
+flowchart TD
+    A["Existing failure spool file"] --> B["--replay-spool"]
+    B --> C["Read records without modifying source spool"]
+    C --> D{"Sender is replayable?"}
+    D -->|discord, lxmf, meshcore| E{"Matching sender configured?"}
+    D -->|meshtastic| F["Skip record"]
+    D -->|unknown| G["Skip record"]
+    E -->|yes| H["Send once through configured best-effort sender"]
+    E -->|no| I["Skip unconfigured record"]
+    H --> J{"Replay failed?"}
+    J -->|yes, failed output configured| K["Append to --replay-failed-output"]
+    J -->|yes, no failed output| L["Log and continue"]
+    J -->|no| M["Count replayed record"]
+```
+
+Current replay behavior:
+
+* Source spool is read-only.
+* Replay targets only `discord`, `lxmf`, and `meshcore`.
+* Meshtastic records are skipped and never replayed.
+* Matching sender configuration is required.
+* Failed replay records can be written to `--replay-failed-output <PATH>`.
+* Replay failures do not stop later records.
+* There is no retry worker, scheduler, daemon, background thread, or async runtime.
+
+## Failure Spool And Replay Relationship
+
+The failure spool captures best-effort sender failures during normal monitoring when `--spool-path <PATH>` is configured. Manual replay later consumes that file as operator-provided input when `--replay-spool <PATH>` is configured.
+
+These modes are intentionally separate:
+
+* Normal monitoring decodes NOAA SAME/EAS audio and sends new alerts.
+* Replay mode retries existing best-effort failure records and then exits.
+* `--spool-path` controls failure capture during monitoring.
+* `--replay-spool` controls one-shot replay input.
+* `--replay-failed-output` optionally captures records that still fail during replay.
+
+## PR Automation
+
+The repository includes a PowerShell PR helper at `scripts/create-pr.ps1`. It validates formatting and tests, pushes the current feature branch to `origin`, and creates or helps create a PR against `hiltonfam/Project-Sentinel:master`.
+
+The script is project safety tooling, not runtime Sentinel behavior. See [PR Workflow](PR_WORKFLOW.md) for details.
 
 ## Current Project Boundaries
 
@@ -145,15 +225,19 @@ Sentinel currently includes:
 * Synchronous sender/fan-out architecture.
 * Required Meshtastic sender.
 * Optional Discord webhook sender.
+* Optional Reticulum/LXMF helper sender.
+* Optional MeshCore helper sender.
 * Optional best-effort failure spool.
+* One-shot manual replay for spooled best-effort failures.
+* Pull request workflow automation.
 
 Sentinel does not currently include:
 
 * CAP ingestion.
 * Skywarn ingestion.
-* Reticulum/LXMF sending.
-* MeshCore sending.
-* Replay workers.
+* Native Reticulum/LXMF protocol implementation.
+* Native MeshCore protocol implementation.
+* Background replay workers.
 * Dashboard or incident command UI.
 * ATAK interoperability.
 * Background processing.
@@ -163,9 +247,7 @@ Sentinel does not currently include:
 
 These are intended evolution points, not current features.
 
-* Reticulum/LXMF: a future optional sender for resilient store-and-forward messaging.
-* MeshCore: a future optional sender for MeshCore-compatible networks.
-* Replay workers: future processing for retrying spooled best-effort failures.
+* Replay workers: future automated processing for retrying spooled best-effort failures.
 * Dashboard: a future Incident Command dashboard foundation for operator visibility.
 * Skywarn ingestion: a future pipeline for Skywarn-related inputs.
 * ATAK: future interoperability for tactical situational awareness workflows.
