@@ -1,5 +1,6 @@
 mod alert;
 mod discord_sender;
+pub mod event_contracts;
 mod lxmf_sender;
 mod meshcore_sender;
 mod meshtastic_sender;
