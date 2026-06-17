@@ -38,12 +38,15 @@ The dashboard reads the JSONL event log on request and renders local HTML with i
 
 It shows:
 
+* Operator summary counts.
 * Event log health.
 * Recent alerts.
-* Sender status.
-* Delivery attempts grouped by alert.
+* Sender status summary cards.
+* Delivery attempts grouped by alert with sender, role, status, channel, and error details.
 * Malformed line count.
 * Truncated record count when the display cap is reached.
+
+The page uses a local HTML meta refresh so command-center displays can update without external assets or background workers.
 
 Missing event logs render a readable dashboard error instead of panicking.
 
