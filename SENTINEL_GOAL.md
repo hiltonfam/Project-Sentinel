@@ -1,152 +1,160 @@
-# Project Sentinel: Unified Disaster Communications and Alert Platform
+# Project Sentinel: NOAA Alert Relay and Mesh Forwarding Platform
 
 ## Mission
 
-Build a resilient, portable, offline-capable emergency communications and situational awareness platform designed for deployment during natural disasters, industrial incidents, and prolonged infrastructure outages.
+Build a resilient, portable, offline-capable alert relay that receives NOAA
+weather alerts and forwards them across local emergency communications paths.
 
-The system must function as a self-contained Incident Command communications hub capable of operating with or without internet connectivity.
+Sentinel is focused on two alert acquisition paths:
 
-The platform should prioritize life safety, interoperability, modularity, and reliability over feature complexity.
+1. NOAA/NWS API ingestion when internet access is available.
+2. NOAA Weather Radio/SAME decoding through RTL-SDR as the offline backup.
+
+Sentinel forwards accepted alerts through:
+
+* Meshtastic.
+* Reticulum/LXMF.
+* MeshCore.
+
+Optional supporting features include:
+
+* Discord notifications.
+* Best-effort failure spool.
+* Manual replay of spooled best-effort failures.
+* Local read-only dashboard.
+
+The platform should prioritize life safety, offline operation, modularity, and
+reliability over feature breadth.
 
 ---
 
 ## Primary Objectives
 
-1. Provide automated alert dissemination from NOAA, SAME, NWS CAP feeds, and other emergency sources.
-2. Operate during extended power and communications outages.
-3. Bridge multiple independent communications networks into a unified alert ecosystem.
-4. Provide a common operational picture for field personnel and incident command.
-5. Be deployable in a Pelican case by a single individual within 15 minutes.
-6. Support both community emergency response and industrial emergency management scenarios.
+1. Receive NOAA alerts from internet and offline radio sources.
+2. Preserve NOAA Weather Radio/SAME as the offline-capable fallback path.
+3. Apply deterministic alert filtering before forwarding.
+4. Forward alerts through local mesh-capable communications systems.
+5. Keep optional integrations best-effort so they cannot weaken primary delivery.
+6. Remain deployable on small field hardware such as Raspberry Pi systems.
 
 ---
 
-## Supported Communications Networks
+## Alert Sources
+
+### NOAA/NWS API
+
+Future Sentinel work should add internet-available NOAA/NWS API ingestion.
+
+Requirements:
+
+* Treat API ingestion as optional and network-dependent.
+* Normalize API alerts into the same internal alert model used by SAME alerts.
+* Preserve local filtering semantics where applicable.
+* Never make internet API availability required for offline operation.
+
+### NOAA Weather Radio / SAME via RTL-SDR
+
+The existing RTL-SDR/SAME path remains the offline backbone.
+
+Requirements:
+
+* Decode SAME/EAS alerts from NOAA Weather Radio audio.
+* Preserve county/location filtering.
+* Preserve national alert override behavior.
+* Preserve test alert behavior.
+* Continue operating without internet access.
+
+---
+
+## Forwarding Networks
 
 ### Meshtastic
 
-* Primary low-bandwidth LoRa alerting network.
-* Support:
+Meshtastic is Sentinel's required primary sender.
 
-  * Direct messages
-  * Channel broadcasts
-  * Multi-channel operation
-  * MQTT bridging when internet is available.
-* Maintain compatibility with upstream Meshtastic releases.
+Requirements:
 
----
+* Preserve existing Meshtastic CLI behavior.
+* Preserve host, port, channel, chunking, and retry behavior.
+* Treat Meshtastic failure as required delivery failure.
 
 ### Reticulum / LXMF
 
-* Encrypted, decentralized messaging backbone.
-* Support:
+Reticulum/LXMF is an optional best-effort sender.
 
-  * LXMF message delivery
-  * Propagation nodes
-  * Store-and-forward capability
-  * Hybrid transport over Wi-Fi, Ethernet, and LoRa.
-* Allow independent operation if Meshtastic is unavailable.
+Requirements:
 
----
+* Use helper-based delivery unless a later milestone explicitly approves native
+  protocol support.
+* Register only when required helper configuration is present.
+* Never block Meshtastic delivery.
 
 ### MeshCore
 
-* Local off-grid community messaging layer.
-* Support:
+MeshCore is an optional best-effort sender.
 
-  * Room broadcasts
-  * Contact messaging
-  * Gateway operation
-  * CLI and API integration.
+Requirements:
 
----
-
-### Skywarn Integration
-
-* Monitor designated amateur radio frequencies.
-* Detect and process severe weather reports.
-* Long-term objective:
-
-  * AI-assisted voice transcription.
-  * Extraction of actionable weather intelligence.
-  * Conversion into structured alert objects.
+* Use helper-based delivery unless a later milestone explicitly approves native
+  protocol support.
+* Register only when required helper configuration is present.
+* Never block Meshtastic delivery.
 
 ---
 
-### NOAA / SAME / CAP
+## Supporting Features
 
-* Support multiple alert acquisition methods:
+### Discord
 
-  * RTL-SDR SAME decoding.
-  * NOAA Weather Radio monitoring.
-  * National Weather Service CAP API ingestion.
-* SAME decoding shall remain the preferred offline alert source.
-* Internet-based CAP shall supplement but never replace local SAME capability.
+Discord remains optional and best-effort.
 
----
+Requirements:
 
-## Incident Command Dashboard
+* Register only when a webhook is configured.
+* Avoid logging sensitive webhook values.
+* Never block Meshtastic delivery.
 
-Develop a unified dashboard displaying:
+### Failure Spool
 
-### Network Status
+The failure spool is an opt-in durability feature for best-effort sender
+failures.
 
-* Meshtastic health.
-* Reticulum health.
-* MeshCore health.
-* SDR health.
-* Internet availability.
-* Power status.
+Requirements:
 
-### Active Alerts
+* Disabled by default.
+* Enabled only when an operator provides a spool path.
+* Records failed best-effort sender attempts.
+* Does not spool required Meshtastic failures unless explicitly approved in a
+  later milestone.
 
-* Tornado warnings.
-* Flash flood warnings.
-* Civil emergency messages.
-* Hazardous materials alerts.
-* Industrial emergency notifications.
+### Manual Replay
 
-### Resource Tracking
+Manual replay retries spooled best-effort failures as a one-shot operator action.
 
-* Node inventory.
-* Field team status.
-* GPS-enabled assets.
-* Communication path visualization.
+Requirements:
 
----
+* No background worker by default.
+* No scheduler by default.
+* Source spool remains read-only.
+* Replay targets only configured best-effort senders.
 
-## Alert Fan-Out Engine
+### Local Read-Only Dashboard
 
-Create a common alert object.
+The dashboard is an optional local visibility aid.
 
-All inbound alerts shall be normalized into this format before distribution.
+Requirements:
 
-Potential destinations include:
-
-* Meshtastic
-* Reticulum LXMF
-* MeshCore
-* Discord
-* Email
-* SMS gateways
-* ATAK
-* Incident Command dashboard
-* Future integrations.
-
-Filtering rules shall support:
-
-* SAME county codes.
-* Event type.
-* Severity.
-* Originator.
-* National-level overrides.
-* User-defined distribution groups.
+* Read-only.
+* Localhost/LAN deployment only.
+* Reads existing event data.
+* Not in the alert delivery path.
+* Sentinel must continue running headless without it.
 
 ---
 
 ## Offline-First Philosophy
 
-The system shall assume internet connectivity is unavailable.
+Sentinel assumes internet connectivity may be unavailable.
 
 Core functionality must continue operating without:
 
@@ -155,7 +163,8 @@ Core functionality must continue operating without:
 * Cellular connectivity.
 * Commercial power.
 
-Internet connectivity, when available, enhances capability but is never required for mission-critical operations.
+Internet connectivity, when available, may enhance alert acquisition through the
+NOAA/NWS API, but it must never replace the local SAME decoding path.
 
 ---
 
@@ -167,72 +176,54 @@ Primary deployment platform:
 
 Secondary deployment options:
 
-* LattePanda.
 * Standard Linux systems.
-* Containerized environments.
+* Windows operator workstations where practical.
 
 Field deployment hardware:
 
-* Pelican case enclosure.
-* LiFePO4 battery system.
-* Solar charging capability.
+* Portable enclosure.
+* Battery power.
+* RTL-SDR receiver.
+* NOAA Weather Radio antenna.
 * Meshtastic gateway node.
-* Reticulum gateway node.
-* MeshCore gateway node.
-* RTL-SDR receivers.
-* External antenna connections.
-
----
-
-## Software Design Principles
-
-1. Modular architecture.
-2. Plugin-based integrations.
-3. Open-source licensing.
-4. Extensive automated testing.
-5. Configuration-driven behavior.
-6. Graceful degradation under failure conditions.
-7. Minimal hardware requirements.
-8. Comprehensive logging and observability.
+* Optional Reticulum/LXMF helper environment.
+* Optional MeshCore helper environment.
 
 ---
 
 ## Development Priorities
 
-### Phase 1
+### Near-Term
 
-* NOAA SAME decoding.
-* Meshtastic alert forwarding.
-* County filtering.
-* Test alert handling.
+* Preserve and harden NOAA Weather Radio/SAME decoding.
+* Preserve and harden Meshtastic forwarding.
+* Keep Reticulum/LXMF and MeshCore helper senders best-effort.
+* Improve event logging and local read-only visibility.
+* Prepare repeatable releases.
 
-### Phase 2
+### Future
 
-* Discord integration.
-* Reticulum LXMF integration.
-* MeshCore integration.
-* Alert spooling and retry mechanisms.
+* Add NOAA/NWS API ingestion as an internet-available supplement.
+* Normalize API and SAME alerts into a shared internal model.
+* Improve operational packaging for Raspberry Pi and Linux deployments.
+* Continue strengthening tests around filtering, routing, forwarding, replay,
+  and dashboard read models.
 
-### Phase 3
+---
 
-* Unified Incident Command dashboard.
-* Alert history and analytics.
-* GPS asset visualization.
-* Role-based user interfaces.
+## Explicit Non-Scope
 
-### Phase 4
+Sentinel is not a general command/control platform.
 
-* AI-assisted Skywarn transcription.
-* Automatic severe weather intelligence extraction.
-* ATAK interoperability.
-* Predictive incident support tools.
+The following are not in scope:
 
-### Phase 5
-
-* Multi-case deployment support.
-* High-availability clustering.
-* Community mesh federation.
-* Industrial incident command enhancements.
+* ATAK integration.
+* GPS tracking.
+* Body camera integrations.
+* Map or mapping features.
+* Asset tracking platforms.
+* Team tracking platforms.
+* Unrelated incident command systems.
 
 ---
 
@@ -240,8 +231,13 @@ Field deployment hardware:
 
 The project is successful when:
 
-* A Tornado Warning received via NOAA SAME can automatically propagate through Meshtastic, Reticulum, MeshCore, and Incident Command interfaces within seconds.
-* The system remains functional during a multi-day power outage.
-* Field personnel receive actionable alerts regardless of which supported communications network they use.
-* The platform can be deployed rapidly by a single operator.
-* The solution remains maintainable and extensible for future emergency communications technologies.
+* A NOAA Weather Radio/SAME alert can automatically propagate through
+  Meshtastic and configured best-effort mesh senders within seconds.
+* A NOAA/NWS API alert, when internet is available, can follow the same filtering
+  and forwarding path.
+* The system remains functional during a multi-day power or internet outage
+  using the RTL-SDR/SAME path.
+* Operators can inspect local delivery status without putting the dashboard in
+  the alert delivery path.
+* The solution remains maintainable, testable, and focused on NOAA alert relay
+  and mesh forwarding.
