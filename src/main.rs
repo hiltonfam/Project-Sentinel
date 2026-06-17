@@ -14,6 +14,7 @@ mod meshtastic_sender;
 mod normalized_alert;
 #[allow(dead_code)]
 mod nws_client;
+mod nws_polling;
 mod replay;
 mod sender;
 mod spool;
@@ -34,6 +35,8 @@ use log::LevelFilter;
 use lxmf_sender::{LxmfConfig, LxmfSender};
 use meshcore_sender::{MeshCoreConfig, MeshCoreSender};
 use meshtastic_sender::{MeshtasticConfig, MeshtasticSender};
+use nws_client::{NwsClient, NwsClientConfig, UreqNwsHttpClient};
+use nws_polling::{run_nws_polling_loop, NwsPollingConfig, DEFAULT_NWS_POLL_SECONDS};
 use replay::replay_spool_file;
 use rust_embed::RustEmbed;
 use sameold::{Message, SameReceiverBuilder, SignificanceLevel};
@@ -197,6 +200,26 @@ struct Args {
     /// Address and port for the read-only local dashboard
     #[arg(long, default_value = DEFAULT_DASHBOARD_BIND)]
     dashboard_bind: String,
+
+    /// Run opt-in NOAA/NWS API polling mode without alert delivery
+    #[arg(long)]
+    nws_api: bool,
+
+    /// Required User-Agent for NOAA/NWS API requests when --nws-api is enabled
+    #[arg(long)]
+    nws_user_agent: Option<String>,
+
+    /// Optional NOAA/NWS API state/territory area filter
+    #[arg(long)]
+    nws_area: Option<String>,
+
+    /// Optional NOAA/NWS API zone filter
+    #[arg(long)]
+    nws_zone: Option<String>,
+
+    /// NOAA/NWS API poll interval in seconds
+    #[arg(long, default_value_t = DEFAULT_NWS_POLL_SECONDS)]
+    nws_poll_seconds: u64,
 }
 
 fn build_best_effort_senders(args: &Args) -> Result<Vec<Box<dyn Sender>>> {
@@ -296,6 +319,47 @@ fn replay_mode_enabled(args: &Args) -> bool {
 
 fn dashboard_mode_enabled(args: &Args) -> bool {
     args.dashboard_event_log.is_some()
+}
+
+fn nws_mode_enabled(args: &Args) -> bool {
+    args.nws_api
+}
+
+fn build_nws_client_config(args: &Args) -> Result<NwsClientConfig> {
+    if !args.nws_api {
+        return Err(anyhow::anyhow!(
+            "--nws-api is required for NOAA polling mode"
+        ));
+    }
+
+    let user_agent = args
+        .nws_user_agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("--nws-user-agent is required when --nws-api is enabled"))?;
+
+    let config = NwsClientConfig {
+        user_agent: user_agent.to_string(),
+        area: args.nws_area.clone(),
+        zone: args.nws_zone.clone(),
+        ..NwsClientConfig::default()
+    };
+    config.validate()?;
+
+    Ok(config)
+}
+
+fn build_nws_polling_config(args: &Args) -> Result<NwsPollingConfig> {
+    NwsPollingConfig::new(args.nws_poll_seconds)
+}
+
+fn run_nws_mode(args: &Args) -> Result<()> {
+    let client_config = build_nws_client_config(args)?;
+    let polling_config = build_nws_polling_config(args)?;
+    let client = NwsClient::new(client_config, UreqNwsHttpClient)?;
+
+    run_nws_polling_loop(&client, &polling_config)
 }
 
 fn run_dashboard_mode(args: &Args) -> Result<()> {
@@ -405,6 +469,10 @@ fn main() -> Result<()> {
 
     if dashboard_mode_enabled(&args) {
         return run_dashboard_mode(&args);
+    }
+
+    if nws_mode_enabled(&args) {
+        return run_nws_mode(&args);
     }
 
     if replay_mode_enabled(&args) {
@@ -699,6 +767,128 @@ mod tests {
 
         assert!(dashboard_mode_enabled(&args));
         assert_eq!(args.dashboard_bind, "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn nws_mode_is_disabled_without_nws_api_flag() {
+        let args = Args::try_parse_from(["alerter"]).unwrap();
+
+        assert!(!nws_mode_enabled(&args));
+    }
+
+    #[test]
+    fn nws_mode_is_enabled_with_nws_api_flag() {
+        let args = Args::try_parse_from([
+            "alerter",
+            "--nws-api",
+            "--nws-user-agent",
+            "Project-Sentinel test@example.com",
+        ])
+        .unwrap();
+
+        assert!(nws_mode_enabled(&args));
+    }
+
+    #[test]
+    fn nws_user_agent_is_required_when_nws_api_is_enabled() {
+        let args = Args::try_parse_from(["alerter", "--nws-api"]).unwrap();
+
+        let error = build_nws_client_config(&args).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--nws-user-agent is required when --nws-api is enabled"
+        );
+    }
+
+    #[test]
+    fn nws_area_and_zone_are_mutually_exclusive() {
+        let args = Args::try_parse_from([
+            "alerter",
+            "--nws-api",
+            "--nws-user-agent",
+            "Project-Sentinel test@example.com",
+            "--nws-area",
+            "TX",
+            "--nws-zone",
+            "TXC201",
+        ])
+        .unwrap();
+
+        let error = build_nws_client_config(&args).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "configure either NWS area or NWS zone, not both"
+        );
+    }
+
+    #[test]
+    fn nws_client_config_uses_area_filter() {
+        let args = Args::try_parse_from([
+            "alerter",
+            "--nws-api",
+            "--nws-user-agent",
+            "Project-Sentinel test@example.com",
+            "--nws-area",
+            "TX",
+        ])
+        .unwrap();
+
+        let config = build_nws_client_config(&args).unwrap();
+
+        assert_eq!(config.user_agent, "Project-Sentinel test@example.com");
+        assert_eq!(config.area.as_deref(), Some("TX"));
+        assert_eq!(config.zone, None);
+    }
+
+    #[test]
+    fn nws_client_config_uses_zone_filter() {
+        let args = Args::try_parse_from([
+            "alerter",
+            "--nws-api",
+            "--nws-user-agent",
+            "Project-Sentinel test@example.com",
+            "--nws-zone",
+            "TXC201",
+        ])
+        .unwrap();
+
+        let config = build_nws_client_config(&args).unwrap();
+
+        assert_eq!(config.user_agent, "Project-Sentinel test@example.com");
+        assert_eq!(config.area, None);
+        assert_eq!(config.zone.as_deref(), Some("TXC201"));
+    }
+
+    #[test]
+    fn nws_polling_config_defaults_to_sixty_seconds() {
+        let args = Args::try_parse_from(["alerter"]).unwrap();
+
+        let config = build_nws_polling_config(&args).unwrap();
+
+        assert_eq!(config.poll_seconds, 60);
+    }
+
+    #[test]
+    fn nws_polling_config_can_be_overridden() {
+        let args = Args::try_parse_from(["alerter", "--nws-poll-seconds", "30"]).unwrap();
+
+        let config = build_nws_polling_config(&args).unwrap();
+
+        assert_eq!(config.poll_seconds, 30);
+    }
+
+    #[test]
+    fn nws_polling_config_rejects_zero_seconds() {
+        let args = Args::try_parse_from(["alerter", "--nws-poll-seconds", "0"]).unwrap();
+
+        let error = build_nws_polling_config(&args).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--nws-poll-seconds must be greater than 0"
+        );
     }
 
     #[test]
