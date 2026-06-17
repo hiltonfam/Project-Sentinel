@@ -36,7 +36,9 @@ use lxmf_sender::{LxmfConfig, LxmfSender};
 use meshcore_sender::{MeshCoreConfig, MeshCoreSender};
 use meshtastic_sender::{MeshtasticConfig, MeshtasticSender};
 use nws_client::{NwsClient, NwsClientConfig, UreqNwsHttpClient};
-use nws_polling::{run_nws_polling_loop, NwsPollingConfig, DEFAULT_NWS_POLL_SECONDS};
+use nws_polling::{
+    run_nws_polling_loop, FanOutNwsAlertDelivery, NwsPollingConfig, DEFAULT_NWS_POLL_SECONDS,
+};
 use replay::replay_spool_file;
 use rust_embed::RustEmbed;
 use sameold::{Message, SameReceiverBuilder, SignificanceLevel};
@@ -358,8 +360,22 @@ fn run_nws_mode(args: &Args) -> Result<()> {
     let client_config = build_nws_client_config(args)?;
     let polling_config = build_nws_polling_config(args)?;
     let client = NwsClient::new(client_config, UreqNwsHttpClient)?;
+    let mut fanout = build_fanout(args)?;
+    let mut event_emitter = build_event_emitter(args);
+    let channel = args.alert_channel.unwrap_or(0);
+    if !(0..=7).contains(&channel) {
+        return Err(anyhow::anyhow!("alertChannel must be between 0 and 7"));
+    }
 
-    run_nws_polling_loop(&client, &polling_config)
+    let readiness_result = if let Some(event_emitter) = event_emitter.as_deref_mut() {
+        fanout.check_ready_with_events(event_emitter)
+    } else {
+        fanout.check_ready()
+    };
+    readiness_result?;
+
+    let mut delivery = FanOutNwsAlertDelivery::new(&mut fanout, channel, event_emitter);
+    run_nws_polling_loop(&client, &polling_config, &mut delivery)
 }
 
 fn run_dashboard_mode(args: &Args) -> Result<()> {
