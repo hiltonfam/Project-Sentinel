@@ -5,6 +5,7 @@ use crate::event_emitter::{warn_event_write_failure, EventEmitter};
 use crate::normalized_alert::NormalizedAlert;
 use crate::nws_client::{NwsAlertCollection, NwsClient, NwsHttpClient};
 use crate::sender::FanOut;
+use crate::source_health::{source_status_record, SourceHealthInput, SourceKind};
 use anyhow::Result;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -79,6 +80,8 @@ impl PollClock for SystemPollClock {
 
 pub trait NwsAlertDelivery {
     fn deliver_alert(&mut self, alert: &NormalizedAlert, timestamp_unix_secs: u64) -> Result<()>;
+
+    fn record_source_status(&mut self, _record: &crate::event_contracts::SourceStatusRecord) {}
 }
 
 pub struct FanOutNwsAlertDelivery<'a> {
@@ -122,6 +125,55 @@ impl NwsAlertDelivery for FanOutNwsAlertDelivery<'_> {
             self.fanout.send_alert(&runtime_alert, self.channel)
         }
     }
+
+    fn record_source_status(&mut self, record: &crate::event_contracts::SourceStatusRecord) {
+        if let Some(event_emitter) = self.event_emitter.as_deref_mut() {
+            if let Err(e) = event_emitter.emit_source_status(record) {
+                warn_event_write_failure(e);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct NwsSourceHealth {
+    last_success_unix_secs: Option<u64>,
+    last_failure_unix_secs: Option<u64>,
+    last_error: Option<String>,
+}
+
+impl NwsSourceHealth {
+    fn record_success(&mut self, now_unix_secs: u64) -> crate::event_contracts::SourceStatusRecord {
+        self.last_success_unix_secs = Some(now_unix_secs);
+        self.last_error = None;
+        source_status_record(SourceHealthInput {
+            source: SourceKind::NwsApi,
+            now_unix_secs,
+            last_success_unix_secs: self.last_success_unix_secs,
+            last_failure_unix_secs: self.last_failure_unix_secs,
+            last_decoded_message_unix_secs: None,
+            last_accepted_alert_unix_secs: None,
+            error: None,
+        })
+    }
+
+    fn record_failure(
+        &mut self,
+        now_unix_secs: u64,
+        error: String,
+    ) -> crate::event_contracts::SourceStatusRecord {
+        self.last_failure_unix_secs = Some(now_unix_secs);
+        self.last_error = Some(error);
+        source_status_record(SourceHealthInput {
+            source: SourceKind::NwsApi,
+            now_unix_secs,
+            last_success_unix_secs: self.last_success_unix_secs,
+            last_failure_unix_secs: self.last_failure_unix_secs,
+            last_decoded_message_unix_secs: None,
+            last_accepted_alert_unix_secs: None,
+            error: self.last_error.clone(),
+        })
+    }
 }
 
 pub fn run_nws_polling_loop<F, D>(
@@ -134,11 +186,18 @@ where
     D: NwsAlertDelivery,
 {
     let mut dedup_gate = DedupGate::default();
+    let mut source_health = NwsSourceHealth::default();
     let clock = SystemPollClock;
     let sleeper = StdPollSleeper;
 
     loop {
-        match run_nws_polling_once(fetcher, &mut dedup_gate, &clock, delivery) {
+        match run_nws_polling_once(
+            fetcher,
+            &mut dedup_gate,
+            &mut source_health,
+            &clock,
+            delivery,
+        ) {
             Ok(summary) => log_nws_polling_summary(&summary),
             Err(e) => log::warn!("NOAA/NWS API polling failed: {}", e),
         }
@@ -150,6 +209,7 @@ where
 pub fn run_nws_polling_iterations<F, C, S>(
     fetcher: &F,
     dedup_gate: &mut DedupGate,
+    source_health: &mut NwsSourceHealth,
     config: &NwsPollingConfig,
     clock: &C,
     sleeper: &S,
@@ -164,7 +224,13 @@ where
     let mut summaries = Vec::new();
 
     for iteration in 0..iterations {
-        summaries.push(run_nws_polling_once(fetcher, dedup_gate, clock, delivery)?);
+        summaries.push(run_nws_polling_once(
+            fetcher,
+            dedup_gate,
+            source_health,
+            clock,
+            delivery,
+        )?);
         if iteration + 1 < iterations {
             sleeper.sleep(Duration::from_secs(config.poll_seconds));
         }
@@ -176,6 +242,7 @@ where
 pub fn run_nws_polling_once<F, C>(
     fetcher: &F,
     dedup_gate: &mut DedupGate,
+    source_health: &mut NwsSourceHealth,
     clock: &C,
     delivery: &mut impl NwsAlertDelivery,
 ) -> Result<NwsPollingSummary>
@@ -183,11 +250,23 @@ where
     F: ActiveAlertFetcher,
     C: PollClock,
 {
-    let collection = fetcher.fetch_active_alerts()?;
+    let now_unix_secs = clock.now_unix_secs();
+    let collection = match fetcher.fetch_active_alerts() {
+        Ok(collection) => {
+            let record = source_health.record_success(now_unix_secs);
+            delivery.record_source_status(&record);
+            collection
+        }
+        Err(e) => {
+            let record = source_health.record_failure(now_unix_secs, e.to_string());
+            delivery.record_source_status(&record);
+            return Err(e);
+        }
+    };
     Ok(process_nws_alert_collection(
         collection,
         dedup_gate,
-        clock.now_unix_secs(),
+        now_unix_secs,
         delivery,
     ))
 }
@@ -460,6 +539,7 @@ mod tests {
     struct RecordingEventEmitter {
         alerts: Rc<RefCell<Vec<AlertRecord>>>,
         delivery_attempts: Rc<RefCell<Vec<DeliveryAttemptRecord>>>,
+        source_statuses: Rc<RefCell<Vec<crate::event_contracts::SourceStatusRecord>>>,
     }
 
     impl EventEmitter for RecordingEventEmitter {
@@ -474,6 +554,14 @@ mod tests {
         }
 
         fn emit_sender_status(&mut self, _record: &SenderStatusRecord) -> Result<()> {
+            Ok(())
+        }
+
+        fn emit_source_status(
+            &mut self,
+            record: &crate::event_contracts::SourceStatusRecord,
+        ) -> Result<()> {
+            self.source_statuses.borrow_mut().push(record.clone());
             Ok(())
         }
     }
@@ -503,10 +591,17 @@ mod tests {
         let fetcher = MockFetcher::new(vec![Ok(collection(EMPTY_ACTIVE_ALERTS))]);
         let clock = FixedClock { now_unix_secs: 100 };
         let mut dedup_gate = DedupGate::default();
+        let mut source_health = NwsSourceHealth::default();
         let mut delivery = RecordingDelivery::default();
 
-        let summary =
-            run_nws_polling_once(&fetcher, &mut dedup_gate, &clock, &mut delivery).unwrap();
+        let summary = run_nws_polling_once(
+            &fetcher,
+            &mut dedup_gate,
+            &mut source_health,
+            &clock,
+            &mut delivery,
+        )
+        .unwrap();
 
         assert_eq!(*fetcher.calls.borrow(), 1);
         assert_eq!(summary.fetched_alerts, 0);
@@ -517,10 +612,17 @@ mod tests {
         let fetcher = MockFetcher::new(vec![Ok(collection(MINIMAL_ACTIVE_ALERTS))]);
         let clock = FixedClock { now_unix_secs: 100 };
         let mut dedup_gate = DedupGate::default();
+        let mut source_health = NwsSourceHealth::default();
         let mut delivery = RecordingDelivery::default();
 
-        let summary =
-            run_nws_polling_once(&fetcher, &mut dedup_gate, &clock, &mut delivery).unwrap();
+        let summary = run_nws_polling_once(
+            &fetcher,
+            &mut dedup_gate,
+            &mut source_health,
+            &clock,
+            &mut delivery,
+        )
+        .unwrap();
 
         assert_eq!(
             summary,
@@ -546,11 +648,13 @@ mod tests {
         let sleeper = RecordingSleeper::default();
         let config = NwsPollingConfig::new(60).unwrap();
         let mut dedup_gate = DedupGate::default();
+        let mut source_health = NwsSourceHealth::default();
         let mut delivery = RecordingDelivery::default();
 
         let summaries = run_nws_polling_iterations(
             &fetcher,
             &mut dedup_gate,
+            &mut source_health,
             &config,
             &clock,
             &sleeper,
@@ -576,11 +680,13 @@ mod tests {
         let sleeper = RecordingSleeper::default();
         let config = NwsPollingConfig::new(12).unwrap();
         let mut dedup_gate = DedupGate::default();
+        let mut source_health = NwsSourceHealth::default();
         let mut delivery = RecordingDelivery::default();
 
         let summaries = run_nws_polling_iterations(
             &fetcher,
             &mut dedup_gate,
+            &mut source_health,
             &config,
             &clock,
             &sleeper,
@@ -601,10 +707,17 @@ mod tests {
         let fetcher = MockFetcher::new(vec![Ok(collection(MISSING_EVENT_ACTIVE_ALERTS))]);
         let clock = FixedClock { now_unix_secs: 100 };
         let mut dedup_gate = DedupGate::default();
+        let mut source_health = NwsSourceHealth::default();
         let mut delivery = RecordingDelivery::default();
 
-        let summary =
-            run_nws_polling_once(&fetcher, &mut dedup_gate, &clock, &mut delivery).unwrap();
+        let summary = run_nws_polling_once(
+            &fetcher,
+            &mut dedup_gate,
+            &mut source_health,
+            &clock,
+            &mut delivery,
+        )
+        .unwrap();
 
         assert_eq!(summary.fetched_alerts, 1);
         assert_eq!(summary.normalized_alerts, 0);
@@ -618,13 +731,94 @@ mod tests {
         let fetcher = MockFetcher::new(vec![Err(anyhow!("network unavailable"))]);
         let clock = FixedClock { now_unix_secs: 100 };
         let mut dedup_gate = DedupGate::default();
+        let mut source_health = NwsSourceHealth::default();
         let mut delivery = RecordingDelivery::default();
 
-        let error =
-            run_nws_polling_once(&fetcher, &mut dedup_gate, &clock, &mut delivery).unwrap_err();
+        let error = run_nws_polling_once(
+            &fetcher,
+            &mut dedup_gate,
+            &mut source_health,
+            &clock,
+            &mut delivery,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("network unavailable"));
         assert!(delivery.alerts.borrow().is_empty());
+    }
+
+    #[test]
+    fn api_success_emits_healthy_source_status_when_events_are_enabled() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let source_statuses = Rc::new(RefCell::new(Vec::new()));
+        let emitter = RecordingEventEmitter {
+            source_statuses: Rc::clone(&source_statuses),
+            ..RecordingEventEmitter::default()
+        };
+        let fetcher = MockFetcher::new(vec![Ok(collection(EMPTY_ACTIVE_ALERTS))]);
+        let clock = FixedClock { now_unix_secs: 100 };
+        let mut dedup_gate = DedupGate::default();
+        let mut source_health = NwsSourceHealth::default();
+        let mut fanout = FanOut::new(vec![Box::new(RecordingSender::new(
+            "meshtastic",
+            Rc::clone(&calls),
+        ))]);
+        let mut delivery = FanOutNwsAlertDelivery::new(&mut fanout, 2, Some(Box::new(emitter)));
+
+        let summary = run_nws_polling_once(
+            &fetcher,
+            &mut dedup_gate,
+            &mut source_health,
+            &clock,
+            &mut delivery,
+        )
+        .unwrap();
+
+        assert_eq!(summary.fetched_alerts, 0);
+        let statuses = source_statuses.borrow();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].source, "nws_api");
+        assert_eq!(
+            statuses[0].state,
+            crate::event_contracts::SourceState::Healthy
+        );
+        assert_eq!(statuses[0].last_success_unix_secs, Some(100));
+    }
+
+    #[test]
+    fn api_failure_emits_source_status_without_delivery() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let source_statuses = Rc::new(RefCell::new(Vec::new()));
+        let emitter = RecordingEventEmitter {
+            source_statuses: Rc::clone(&source_statuses),
+            ..RecordingEventEmitter::default()
+        };
+        let fetcher = MockFetcher::new(vec![Err(anyhow!("network unavailable"))]);
+        let clock = FixedClock { now_unix_secs: 100 };
+        let mut dedup_gate = DedupGate::default();
+        let mut source_health = NwsSourceHealth::default();
+        let mut fanout = FanOut::new(vec![Box::new(RecordingSender::new(
+            "meshtastic",
+            Rc::clone(&calls),
+        ))]);
+        let mut delivery = FanOutNwsAlertDelivery::new(&mut fanout, 2, Some(Box::new(emitter)));
+
+        let error = run_nws_polling_once(
+            &fetcher,
+            &mut dedup_gate,
+            &mut source_health,
+            &clock,
+            &mut delivery,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("network unavailable"));
+        assert!(calls.borrow().is_empty());
+        let statuses = source_statuses.borrow();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].source, "nws_api");
+        assert_eq!(statuses[0].last_failure_unix_secs, Some(100));
+        assert_eq!(statuses[0].error.as_deref(), Some("network unavailable"));
     }
 
     #[test]
@@ -632,10 +826,17 @@ mod tests {
         let fetcher = MockFetcher::new(vec![Ok(collection(MINIMAL_ACTIVE_ALERTS))]);
         let clock = FixedClock { now_unix_secs: 100 };
         let mut dedup_gate = DedupGate::default();
+        let mut source_health = NwsSourceHealth::default();
         let mut delivery = RecordingDelivery::with_error("delivery unavailable");
 
-        let summary =
-            run_nws_polling_once(&fetcher, &mut dedup_gate, &clock, &mut delivery).unwrap();
+        let summary = run_nws_polling_once(
+            &fetcher,
+            &mut dedup_gate,
+            &mut source_health,
+            &clock,
+            &mut delivery,
+        )
+        .unwrap();
 
         assert_eq!(summary.accepted_alerts, 1);
         assert_eq!(summary.delivery_failures, 1);
@@ -759,6 +960,7 @@ mod tests {
         let emitter = RecordingEventEmitter {
             alerts: Rc::clone(&alerts),
             delivery_attempts: Rc::clone(&attempts),
+            source_statuses: Rc::new(RefCell::new(Vec::new())),
         };
         let mut fanout = FanOut::new(vec![Box::new(RecordingSender::new(
             "meshtastic",

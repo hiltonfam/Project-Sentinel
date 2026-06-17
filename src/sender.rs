@@ -392,6 +392,13 @@ mod tests {
                 Ok(())
             }
         }
+
+        fn emit_source_status(
+            &mut self,
+            _record: &crate::event_contracts::SourceStatusRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     fn test_alert() -> Alert {

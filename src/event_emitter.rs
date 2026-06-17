@@ -1,5 +1,5 @@
 use crate::event_contracts::{
-    AlertRecord, DeliveryAttemptRecord, JsonLineRecord, SenderStatusRecord,
+    AlertRecord, DeliveryAttemptRecord, JsonLineRecord, SenderStatusRecord, SourceStatusRecord,
 };
 use anyhow::Result;
 use std::fs::OpenOptions;
@@ -10,6 +10,7 @@ pub trait EventEmitter {
     fn emit_alert(&mut self, record: &AlertRecord) -> Result<()>;
     fn emit_delivery_attempt(&mut self, record: &DeliveryAttemptRecord) -> Result<()>;
     fn emit_sender_status(&mut self, record: &SenderStatusRecord) -> Result<()>;
+    fn emit_source_status(&mut self, record: &SourceStatusRecord) -> Result<()>;
 }
 
 pub struct FileEventEmitter {
@@ -43,6 +44,10 @@ impl EventEmitter for FileEventEmitter {
     fn emit_sender_status(&mut self, record: &SenderStatusRecord) -> Result<()> {
         self.append_record(record)
     }
+
+    fn emit_source_status(&mut self, record: &SourceStatusRecord) -> Result<()> {
+        self.append_record(record)
+    }
 }
 
 pub fn warn_event_write_failure(error: anyhow::Error) {
@@ -54,7 +59,8 @@ mod tests {
     use super::*;
     use crate::alert::AlertSignificance;
     use crate::event_contracts::{
-        DeliveryAttemptStatus, SenderStatusRecord, EVENT_CONTRACT_SCHEMA_VERSION,
+        DeliveryAttemptStatus, SenderStatusRecord, SourceState, SourceStatusRecord,
+        EVENT_CONTRACT_SCHEMA_VERSION,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -113,17 +119,31 @@ mod tests {
             last_failure_unix_secs: None,
             error: None,
         };
+        let source_status = SourceStatusRecord {
+            schema_version: EVENT_CONTRACT_SCHEMA_VERSION,
+            record_type: "source_status".to_string(),
+            timestamp_unix_secs: 1003,
+            source: "nws_api".to_string(),
+            state: SourceState::Healthy,
+            last_success_unix_secs: Some(1003),
+            last_failure_unix_secs: None,
+            last_decoded_message_unix_secs: None,
+            last_accepted_alert_unix_secs: None,
+            error: None,
+        };
 
         emitter.emit_alert(&alert).unwrap();
         emitter.emit_delivery_attempt(&attempt).unwrap();
         emitter.emit_sender_status(&status).unwrap();
+        emitter.emit_source_status(&source_status).unwrap();
 
         let contents = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 4);
         assert_eq!(lines[0], alert.to_json_line());
         assert_eq!(lines[1], attempt.to_json_line());
         assert_eq!(lines[2], status.to_json_line());
+        assert_eq!(lines[3], source_status.to_json_line());
 
         let _ = fs::remove_file(path);
     }

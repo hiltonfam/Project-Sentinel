@@ -1,5 +1,5 @@
 use crate::event_contracts::{
-    AlertRecord, DeliveryAttemptRecord, JsonLineRecord, SenderStatusRecord,
+    AlertRecord, DeliveryAttemptRecord, JsonLineRecord, SenderStatusRecord, SourceStatusRecord,
 };
 use anyhow::Result;
 use serde::Deserialize;
@@ -15,6 +15,7 @@ pub struct DashboardData {
     pub alerts: Vec<AlertRecord>,
     pub delivery_attempts_by_alert: HashMap<String, Vec<DeliveryAttemptRecord>>,
     pub sender_statuses: Vec<SenderStatusRecord>,
+    pub source_statuses: Vec<SourceStatusRecord>,
     pub malformed_lines: usize,
     pub parsed_records: usize,
     pub truncated_records: usize,
@@ -42,6 +43,7 @@ where
 {
     let mut data = DashboardData::default();
     let mut latest_sender_statuses: HashMap<String, (usize, SenderStatusRecord)> = HashMap::new();
+    let mut latest_source_statuses: HashMap<String, (usize, SourceStatusRecord)> = HashMap::new();
 
     for line_result in lines {
         let line = match line_result {
@@ -92,6 +94,14 @@ where
                 }
                 Err(_) => data.malformed_lines += 1,
             },
+            "source_status" => match SourceStatusRecord::from_json_line(&line) {
+                Ok(record) => {
+                    data.parsed_records += 1;
+                    latest_source_statuses
+                        .insert(record.source.clone(), (data.parsed_records, record));
+                }
+                Err(_) => data.malformed_lines += 1,
+            },
             _ => {
                 data.malformed_lines += 1;
             }
@@ -102,6 +112,14 @@ where
         latest_sender_statuses.into_values().collect();
     statuses.sort_by_key(|(order, _record)| *order);
     data.sender_statuses = statuses
+        .into_iter()
+        .map(|(_order, record)| record)
+        .collect();
+
+    let mut source_statuses: Vec<(usize, SourceStatusRecord)> =
+        latest_source_statuses.into_values().collect();
+    source_statuses.sort_by_key(|(order, _record)| *order);
+    data.source_statuses = source_statuses
         .into_iter()
         .map(|(_order, record)| record)
         .collect();
@@ -117,7 +135,9 @@ where
 mod tests {
     use super::*;
     use crate::alert::AlertSignificance;
-    use crate::event_contracts::{DeliveryAttemptStatus, EVENT_CONTRACT_SCHEMA_VERSION};
+    use crate::event_contracts::{
+        DeliveryAttemptStatus, SourceState, SourceStatusRecord, EVENT_CONTRACT_SCHEMA_VERSION,
+    };
 
     fn lines(values: &[&str]) -> Vec<Result<String, std::io::Error>> {
         values
@@ -181,18 +201,51 @@ mod tests {
         .to_json_line()
     }
 
+    fn source_status_line(source: &str, state: SourceState, timestamp: u64) -> String {
+        SourceStatusRecord {
+            schema_version: EVENT_CONTRACT_SCHEMA_VERSION,
+            record_type: "source_status".to_string(),
+            timestamp_unix_secs: timestamp,
+            source: source.to_string(),
+            state,
+            last_success_unix_secs: if state == SourceState::Healthy {
+                Some(timestamp)
+            } else {
+                None
+            },
+            last_failure_unix_secs: if state == SourceState::Offline {
+                Some(timestamp)
+            } else {
+                None
+            },
+            last_decoded_message_unix_secs: None,
+            last_accepted_alert_unix_secs: None,
+            error: if state == SourceState::Offline {
+                Some("unavailable".to_string())
+            } else {
+                None
+            },
+        }
+        .to_json_line()
+    }
+
     #[test]
     fn parses_mixed_jsonl_records() {
         let alert = alert_line("alert-1", 10);
         let delivery = delivery_line("alert-1", "meshtastic");
         let status = sender_status_line("meshtastic", true, 12);
+        let source = source_status_line("nws_api", SourceState::Healthy, 13);
 
-        let data = read_dashboard_lines(lines(&[&alert, &delivery, &status]), MAX_DISPLAY_RECORDS);
+        let data = read_dashboard_lines(
+            lines(&[&alert, &delivery, &status, &source]),
+            MAX_DISPLAY_RECORDS,
+        );
 
-        assert_eq!(data.parsed_records, 3);
+        assert_eq!(data.parsed_records, 4);
         assert_eq!(data.alerts.len(), 1);
         assert_eq!(data.delivery_attempts_by_alert["alert-1"].len(), 1);
         assert_eq!(data.sender_statuses.len(), 1);
+        assert_eq!(data.source_statuses.len(), 1);
         assert_eq!(data.malformed_lines, 0);
     }
 
@@ -230,6 +283,19 @@ mod tests {
         assert_eq!(data.sender_statuses[0].sender, "discord");
         assert!(data.sender_statuses[0].ready);
         assert_eq!(data.sender_statuses[0].timestamp_unix_secs, 11);
+    }
+
+    #[test]
+    fn latest_source_status_wins() {
+        let old = source_status_line("nws_api", SourceState::Offline, 10);
+        let new = source_status_line("nws_api", SourceState::Healthy, 11);
+
+        let data = read_dashboard_lines(lines(&[&old, &new]), MAX_DISPLAY_RECORDS);
+
+        assert_eq!(data.source_statuses.len(), 1);
+        assert_eq!(data.source_statuses[0].source, "nws_api");
+        assert_eq!(data.source_statuses[0].state, SourceState::Healthy);
+        assert_eq!(data.source_statuses[0].timestamp_unix_secs, 11);
     }
 
     #[test]

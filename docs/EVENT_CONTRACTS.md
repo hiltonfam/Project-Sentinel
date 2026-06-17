@@ -43,6 +43,7 @@ Current emission behavior:
 * `AlertRecord` is written after an alert passes SAME filtering and before fan-out delivery.
 * `DeliveryAttemptRecord` is written after observable sender attempts.
 * `SenderStatusRecord` is written after sender readiness checks.
+* `SourceStatusRecord` is written for observable NOAA API polling and SAME receiver status when available.
 * `SystemStatusRecord` remains a defined contract but is not emitted yet.
 
 If `--event-log-path` is absent, Sentinel does not write event records.
@@ -127,6 +128,34 @@ Example:
 
 ```json
 {"schema_version":1,"record_type":"sender_status","timestamp_unix_secs":1002,"sender":"discord","configured":true,"required":false,"ready":false,"last_success_unix_secs":900,"last_failure_unix_secs":1001,"error":"webhook unavailable"}
+```
+
+## SourceStatusRecord
+
+Represents a point-in-time view of an alert source.
+
+Current source names:
+
+* `nws_api`: NOAA/NWS API polling source.
+* `same_radio`: NOAA Weather Radio/SAME receiver source.
+
+Fields:
+
+* `schema_version`: `1`.
+* `record_type`: `"source_status"`.
+* `timestamp_unix_secs`: time the status was recorded.
+* `source`: source name.
+* `state`: `"Unknown"`, `"Healthy"`, `"Degraded"`, or `"Offline"`.
+* `last_success_unix_secs`: latest successful source observation, or `null`.
+* `last_failure_unix_secs`: latest failed source observation, or `null`.
+* `last_decoded_message_unix_secs`: latest decoded SAME message time, or `null`.
+* `last_accepted_alert_unix_secs`: latest accepted SAME alert time, or `null`.
+* `error`: latest error summary, or `null`.
+
+Example:
+
+```json
+{"schema_version":1,"record_type":"source_status","timestamp_unix_secs":1004,"source":"nws_api","state":"Healthy","last_success_unix_secs":1004,"last_failure_unix_secs":null,"last_decoded_message_unix_secs":null,"last_accepted_alert_unix_secs":null,"error":null}
 ```
 
 ## SystemStatusRecord
