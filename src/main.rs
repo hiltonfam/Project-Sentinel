@@ -1,6 +1,8 @@
 mod alert;
 mod dashboard;
 mod dashboard_view;
+#[allow(dead_code)]
+mod dedup;
 mod discord_sender;
 pub mod event_contracts;
 mod event_emitter;
