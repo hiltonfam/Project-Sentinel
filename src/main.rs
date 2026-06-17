@@ -1,7 +1,10 @@
 mod alert;
+mod dashboard;
+mod dashboard_view;
 mod discord_sender;
 pub mod event_contracts;
 mod event_emitter;
+mod event_log_reader;
 mod lxmf_sender;
 mod meshcore_sender;
 mod meshtastic_sender;
@@ -17,6 +20,7 @@ use anyhow::Result;
 use byteorder::{NativeEndian, ReadBytesExt};
 use clap::Parser;
 use csv::ReaderBuilder;
+use dashboard::{run_dashboard, DEFAULT_DASHBOARD_BIND};
 use discord_sender::DiscordSender;
 use event_contracts::{AlertRecord, EVENT_CONTRACT_SCHEMA_VERSION};
 use event_emitter::{warn_event_write_failure, EventEmitter, FileEventEmitter};
@@ -179,6 +183,14 @@ struct Args {
     /// Optional JSONL path for local dashboard event records
     #[arg(long)]
     event_log_path: Option<PathBuf>,
+
+    /// Run the read-only local dashboard against this event log path
+    #[arg(long)]
+    dashboard_event_log: Option<PathBuf>,
+
+    /// Address and port for the read-only local dashboard
+    #[arg(long, default_value = DEFAULT_DASHBOARD_BIND)]
+    dashboard_bind: String,
 }
 
 fn build_best_effort_senders(args: &Args) -> Result<Vec<Box<dyn Sender>>> {
@@ -274,6 +286,18 @@ fn build_event_emitter(args: &Args) -> Option<Box<dyn EventEmitter>> {
 
 fn replay_mode_enabled(args: &Args) -> bool {
     args.replay_spool.is_some()
+}
+
+fn dashboard_mode_enabled(args: &Args) -> bool {
+    args.dashboard_event_log.is_some()
+}
+
+fn run_dashboard_mode(args: &Args) -> Result<()> {
+    let Some(event_log_path) = &args.dashboard_event_log else {
+        return Ok(());
+    };
+
+    run_dashboard(event_log_path.clone(), &args.dashboard_bind)
 }
 
 fn run_replay_mode(args: &Args) -> Result<()> {
@@ -372,6 +396,10 @@ fn main() -> Result<()> {
 
     // Parse the command line arguments
     let args = Args::parse();
+
+    if dashboard_mode_enabled(&args) {
+        return run_dashboard_mode(&args);
+    }
 
     if replay_mode_enabled(&args) {
         return run_replay_mode(&args);
@@ -633,6 +661,38 @@ mod tests {
         let args = Args::try_parse_from(["alerter", "--replay-spool", "failures.jsonl"]).unwrap();
 
         assert!(replay_mode_enabled(&args));
+    }
+
+    #[test]
+    fn dashboard_mode_is_disabled_without_dashboard_event_log() {
+        let args = Args::try_parse_from(["alerter"]).unwrap();
+
+        assert!(!dashboard_mode_enabled(&args));
+        assert_eq!(args.dashboard_bind, DEFAULT_DASHBOARD_BIND);
+    }
+
+    #[test]
+    fn dashboard_mode_is_enabled_with_dashboard_event_log() {
+        let args =
+            Args::try_parse_from(["alerter", "--dashboard-event-log", "events.jsonl"]).unwrap();
+
+        assert!(dashboard_mode_enabled(&args));
+        assert_eq!(args.dashboard_bind, DEFAULT_DASHBOARD_BIND);
+    }
+
+    #[test]
+    fn dashboard_bind_can_be_overridden() {
+        let args = Args::try_parse_from([
+            "alerter",
+            "--dashboard-event-log",
+            "events.jsonl",
+            "--dashboard-bind",
+            "127.0.0.1:9090",
+        ])
+        .unwrap();
+
+        assert!(dashboard_mode_enabled(&args));
+        assert_eq!(args.dashboard_bind, "127.0.0.1:9090");
     }
 
     #[test]
