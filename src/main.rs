@@ -9,6 +9,8 @@ mod lxmf_sender;
 mod meshcore_sender;
 mod meshtastic_sender;
 #[allow(dead_code)]
+mod normalized_alert;
+#[allow(dead_code)]
 mod nws_client;
 mod replay;
 mod sender;

@@ -1,0 +1,13 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "id": "https://api.weather.gov/alerts/urn:oid:missing-event",
+      "type": "Feature",
+      "properties": {
+        "id": "urn:oid:missing-event",
+        "headline": "Missing event fixture"
+      }
+    }
+  ]
+}
