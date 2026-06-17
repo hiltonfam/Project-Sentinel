@@ -42,6 +42,28 @@ pub enum DeliveryAttemptStatus {
     Skipped,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+pub enum SourceState {
+    Unknown,
+    Healthy,
+    Degraded,
+    Offline,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SourceStatusRecord {
+    pub schema_version: u16,
+    pub record_type: String,
+    pub timestamp_unix_secs: u64,
+    pub source: String,
+    pub state: SourceState,
+    pub last_success_unix_secs: Option<u64>,
+    pub last_failure_unix_secs: Option<u64>,
+    pub last_decoded_message_unix_secs: Option<u64>,
+    pub last_accepted_alert_unix_secs: Option<u64>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SenderStatusRecord {
     pub schema_version: u16,
@@ -81,6 +103,7 @@ pub trait JsonLineRecord: Sized + Serialize + for<'de> Deserialize<'de> {
 
 impl JsonLineRecord for AlertRecord {}
 impl JsonLineRecord for DeliveryAttemptRecord {}
+impl JsonLineRecord for SourceStatusRecord {}
 impl JsonLineRecord for SenderStatusRecord {}
 impl JsonLineRecord for SystemStatusRecord {}
 
@@ -169,6 +192,32 @@ mod tests {
         assert!(!record.to_json_line().contains('\n'));
         assert_eq!(
             SenderStatusRecord::from_json_line(&record.to_json_line()).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn source_status_record_serializes_to_stable_json_line() {
+        let record = SourceStatusRecord {
+            schema_version: EVENT_CONTRACT_SCHEMA_VERSION,
+            record_type: "source_status".to_string(),
+            timestamp_unix_secs: 1002,
+            source: "nws_api".to_string(),
+            state: SourceState::Healthy,
+            last_success_unix_secs: Some(1002),
+            last_failure_unix_secs: None,
+            last_decoded_message_unix_secs: None,
+            last_accepted_alert_unix_secs: None,
+            error: None,
+        };
+
+        assert_eq!(
+            record.to_json_line(),
+            "{\"schema_version\":1,\"record_type\":\"source_status\",\"timestamp_unix_secs\":1002,\"source\":\"nws_api\",\"state\":\"Healthy\",\"last_success_unix_secs\":1002,\"last_failure_unix_secs\":null,\"last_decoded_message_unix_secs\":null,\"last_accepted_alert_unix_secs\":null,\"error\":null}"
+        );
+        assert!(!record.to_json_line().contains('\n'));
+        assert_eq!(
+            SourceStatusRecord::from_json_line(&record.to_json_line()).unwrap(),
             record
         );
     }

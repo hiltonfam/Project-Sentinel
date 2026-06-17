@@ -17,6 +17,7 @@ mod nws_client;
 mod nws_polling;
 mod replay;
 mod sender;
+mod source_health;
 mod spool;
 
 use alert::{
@@ -45,6 +46,7 @@ use sameold::{Message, SameReceiverBuilder, SignificanceLevel};
 use sender::{FanOut, Sender};
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
+use source_health::{source_status_record, SourceHealthInput};
 use spool::FileSpooler;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -465,6 +467,22 @@ fn emit_alert_record(event_emitter: &mut dyn EventEmitter, record: &AlertRecord)
     }
 }
 
+fn emit_same_source_status(
+    event_emitter: &mut dyn EventEmitter,
+    timestamp_unix_secs: u64,
+    last_decoded_message_unix_secs: Option<u64>,
+    last_accepted_alert_unix_secs: Option<u64>,
+) {
+    let record = source_status_record(SourceHealthInput::same_radio(
+        timestamp_unix_secs,
+        last_decoded_message_unix_secs,
+        last_accepted_alert_unix_secs,
+    ));
+    if let Err(e) = event_emitter.emit_source_status(&record) {
+        warn_event_write_failure(e);
+    }
+}
+
 fn main() -> Result<()> {
     // Initialize logging
     SimpleLogger::new()
@@ -562,10 +580,27 @@ fn main() -> Result<()> {
         log::info!("Test alerts will be sent to channel: {}", test_channel)
     }
 
+    let mut last_same_decoded_message_unix_secs;
+    let mut last_same_accepted_alert_unix_secs = None;
+    if let Some(event_emitter) = event_emitter.as_deref_mut() {
+        emit_same_source_status(event_emitter, unix_timestamp_secs(), None, None);
+    }
+
     // Process messages from the audio source
     for msg in rx.iter_messages(audiosrc.map(|sa| sa as f32)) {
         match msg {
             Message::StartOfMessage(hdr) => {
+                let decoded_timestamp = unix_timestamp_secs();
+                last_same_decoded_message_unix_secs = Some(decoded_timestamp);
+                if let Some(event_emitter) = event_emitter.as_deref_mut() {
+                    emit_same_source_status(
+                        event_emitter,
+                        decoded_timestamp,
+                        last_same_decoded_message_unix_secs,
+                        last_same_accepted_alert_unix_secs,
+                    );
+                }
+
                 let evt = hdr.event();
                 let significance = alert_significance(evt.significance());
                 log::info!("Begin SAME voice message: {:?}", hdr);
@@ -641,7 +676,14 @@ fn main() -> Result<()> {
                 let alert_record =
                     alert_record_from_alert_at(&alert, send_channel, unix_timestamp_secs());
                 let alert_id = alert_record.alert_id.clone();
+                last_same_accepted_alert_unix_secs = Some(alert_record.timestamp_unix_secs);
                 if let Some(event_emitter) = event_emitter.as_deref_mut() {
+                    emit_same_source_status(
+                        event_emitter,
+                        alert_record.timestamp_unix_secs,
+                        last_same_decoded_message_unix_secs,
+                        last_same_accepted_alert_unix_secs,
+                    );
                     emit_alert_record(event_emitter, &alert_record);
                     fanout
                         .send_alert_with_events(&alert, send_channel, &alert_id, event_emitter)
@@ -711,6 +753,13 @@ mod tests {
         fn emit_sender_status(
             &mut self,
             _record: &event_contracts::SenderStatusRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn emit_source_status(
+            &mut self,
+            _record: &event_contracts::SourceStatusRecord,
         ) -> Result<()> {
             Ok(())
         }

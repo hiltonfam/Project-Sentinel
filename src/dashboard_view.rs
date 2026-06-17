@@ -1,5 +1,6 @@
 use crate::event_contracts::{
-    AlertRecord, DeliveryAttemptRecord, DeliveryAttemptStatus, SenderStatusRecord,
+    AlertRecord, DeliveryAttemptRecord, DeliveryAttemptStatus, SenderStatusRecord, SourceState,
+    SourceStatusRecord,
 };
 use crate::event_log_reader::DashboardData;
 
@@ -53,6 +54,7 @@ pub fn render_dashboard(event_log_path: &str, data: &DashboardData) -> String {
 
     render_summary_band(&mut html, &summary);
     render_health_section(&mut html, event_log_path, data);
+    render_source_status_section(&mut html, &data.source_statuses);
     render_sender_status_section(&mut html, &data.sender_statuses);
     render_alerts_section(&mut html, data);
 
@@ -156,6 +158,98 @@ fn render_health_item(html: &mut String, label: &str, value: &str) {
         escape_html(label),
         value
     ));
+}
+
+fn render_source_status_section(html: &mut String, statuses: &[SourceStatusRecord]) {
+    html.push_str("<section><h2>Source Status</h2>");
+    html.push_str("<div class=\"status-grid\">");
+    render_source_status_card(html, "NOAA API", source_status(statuses, "nws_api"));
+    render_source_status_card(html, "SAME Radio", source_status(statuses, "same_radio"));
+    html.push_str("</div>");
+
+    for status in statuses {
+        if status.source == "nws_api"
+            && matches!(status.state, SourceState::Degraded | SourceState::Offline)
+        {
+            html.push_str("<p class=\"warn\">NOAA API source is degraded or offline.</p>");
+        }
+        if status.source == "same_radio"
+            && matches!(status.state, SourceState::Degraded | SourceState::Offline)
+        {
+            html.push_str("<p class=\"warn\">SAME receiver has not decoded anything recently.</p>");
+        }
+    }
+    html.push_str("</section>");
+}
+
+fn source_status<'a>(
+    statuses: &'a [SourceStatusRecord],
+    source: &str,
+) -> Option<&'a SourceStatusRecord> {
+    statuses.iter().find(|status| status.source == source)
+}
+
+fn render_source_status_card(html: &mut String, label: &str, status: Option<&SourceStatusRecord>) {
+    let state = status
+        .map(|status| status.state)
+        .unwrap_or(SourceState::Unknown);
+    html.push_str("<div class=\"status-card\">");
+    html.push_str(&format!(
+        "<strong>{}</strong><span class=\"{}\">{}</span>",
+        escape_html(label),
+        source_state_class(state),
+        source_state_label(state)
+    ));
+    html.push_str("<table><tbody>");
+    if let Some(status) = status {
+        html.push_str(&row("Last status", &status.timestamp_unix_secs.to_string()));
+        html.push_str(&row(
+            "Last success",
+            &option_u64(status.last_success_unix_secs),
+        ));
+        html.push_str(&row(
+            "Last failure",
+            &option_u64(status.last_failure_unix_secs),
+        ));
+        html.push_str(&row(
+            "Last decoded",
+            &option_u64(status.last_decoded_message_unix_secs),
+        ));
+        html.push_str(&row(
+            "Last accepted",
+            &option_u64(status.last_accepted_alert_unix_secs),
+        ));
+        html.push_str(&row(
+            "Error",
+            &escape_html(status.error.as_deref().unwrap_or("")),
+        ));
+    } else {
+        html.push_str(&row("Last status", ""));
+        html.push_str(&row("Last success", ""));
+        html.push_str(&row("Last failure", ""));
+        html.push_str(&row("Last decoded", ""));
+        html.push_str(&row("Last accepted", ""));
+        html.push_str(&row("Error", ""));
+    }
+    html.push_str("</tbody></table></div>");
+}
+
+fn source_state_label(state: SourceState) -> &'static str {
+    match state {
+        SourceState::Unknown => "unknown",
+        SourceState::Healthy => "healthy",
+        SourceState::Degraded => "degraded",
+        SourceState::Offline => "offline",
+    }
+}
+
+fn source_state_class(state: SourceState) -> &'static str {
+    match state {
+        SourceState::Unknown => "muted",
+        SourceState::Healthy => "ok",
+        SourceState::Degraded => "warn",
+        SourceState::Offline => "bad",
+    }
 }
 
 fn render_sender_status_section(html: &mut String, statuses: &[SenderStatusRecord]) {
@@ -320,7 +414,9 @@ fn escape_html(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::alert::AlertSignificance;
-    use crate::event_contracts::{DeliveryAttemptStatus, EVENT_CONTRACT_SCHEMA_VERSION};
+    use crate::event_contracts::{
+        DeliveryAttemptStatus, SourceStatusRecord, EVENT_CONTRACT_SCHEMA_VERSION,
+    };
     use std::collections::HashMap;
 
     fn alert_record(alert_id: &str, event: &str) -> AlertRecord {
@@ -383,6 +479,37 @@ mod tests {
         }
     }
 
+    fn source_status_record(source: &str, state: SourceState) -> SourceStatusRecord {
+        SourceStatusRecord {
+            schema_version: EVENT_CONTRACT_SCHEMA_VERSION,
+            record_type: "source_status".to_string(),
+            timestamp_unix_secs: 20,
+            source: source.to_string(),
+            state,
+            last_success_unix_secs: if state == SourceState::Healthy {
+                Some(20)
+            } else {
+                None
+            },
+            last_failure_unix_secs: if state == SourceState::Offline {
+                Some(20)
+            } else {
+                None
+            },
+            last_decoded_message_unix_secs: if source == "same_radio" {
+                Some(10)
+            } else {
+                None
+            },
+            last_accepted_alert_unix_secs: None,
+            error: if state == SourceState::Offline {
+                Some("network unavailable".to_string())
+            } else {
+                None
+            },
+        }
+    }
+
     fn dashboard_data() -> DashboardData {
         let mut attempts = HashMap::new();
         attempts.insert(
@@ -400,6 +527,10 @@ mod tests {
                 sender_status("meshtastic", true),
                 sender_status("discord", false),
             ],
+            source_statuses: vec![
+                source_status_record("nws_api", SourceState::Healthy),
+                source_status_record("same_radio", SourceState::Degraded),
+            ],
             malformed_lines: 0,
             parsed_records: 5,
             truncated_records: 0,
@@ -414,6 +545,8 @@ mod tests {
         assert!(html.contains("Sentinel Dashboard"));
         assert!(html.contains("Tornado Warning"));
         assert!(html.contains("meshtastic"));
+        assert!(html.contains("NOAA API"));
+        assert!(html.contains("SAME Radio"));
         assert!(html.contains("alert &lt;text&gt;"));
         assert!(!html.contains("http://"));
         assert!(!html.contains("https://"));
@@ -441,6 +574,28 @@ mod tests {
         assert!(html.contains("<strong>discord</strong><span class=\"bad\">not ready</span>"));
         assert!(html.contains("required sender"));
         assert!(html.contains("best-effort sender"));
+    }
+
+    #[test]
+    fn source_status_cards_render_correctly() {
+        let html = render_dashboard("events.jsonl", &dashboard_data());
+
+        assert!(html.contains("<strong>NOAA API</strong><span class=\"ok\">healthy</span>"));
+        assert!(html.contains("<strong>SAME Radio</strong><span class=\"warn\">degraded</span>"));
+        assert!(html.contains("SAME receiver has not decoded anything recently."));
+    }
+
+    #[test]
+    fn missing_source_status_renders_unknown() {
+        let data = DashboardData {
+            source_statuses: Vec::new(),
+            ..dashboard_data()
+        };
+
+        let html = render_dashboard("events.jsonl", &data);
+
+        assert!(html.contains("<strong>NOAA API</strong><span class=\"muted\">unknown</span>"));
+        assert!(html.contains("<strong>SAME Radio</strong><span class=\"muted\">unknown</span>"));
     }
 
     #[test]
