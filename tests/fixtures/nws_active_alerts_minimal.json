@@ -1,0 +1,29 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "id": "https://api.weather.gov/alerts/urn:oid:1",
+      "type": "Feature",
+      "properties": {
+        "id": "urn:oid:1",
+        "event": "Tornado Warning",
+        "headline": "Tornado Warning issued June 16 at 1:00PM CDT",
+        "description": "A tornado warning is in effect.",
+        "instruction": "Take shelter now.",
+        "severity": "Extreme",
+        "urgency": "Immediate",
+        "certainty": "Observed",
+        "effective": "2026-06-16T13:00:00-05:00",
+        "expires": "2026-06-16T13:45:00-05:00",
+        "ends": "2026-06-16T13:45:00-05:00",
+        "status": "Actual",
+        "messageType": "Alert",
+        "areaDesc": "Central Harris County",
+        "geocode": {
+          "SAME": ["048201"],
+          "UGC": ["TXC201"]
+        }
+      }
+    }
+  ]
+}

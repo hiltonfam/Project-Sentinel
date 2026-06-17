@@ -1,0 +1,13 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "id": "https://api.weather.gov/alerts/urn:oid:2",
+      "type": "Feature",
+      "properties": {
+        "id": "urn:oid:2",
+        "event": "Severe Thunderstorm Warning"
+      }
+    }
+  ]
+}
