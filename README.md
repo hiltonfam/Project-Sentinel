@@ -21,7 +21,9 @@ Sentinel exists to keep critical alerts moving when normal infrastructure is deg
 * One-shot manual replay of spooled best-effort failures.
 * Synchronous sender/fan-out architecture.
 
-Sentinel does not currently include a native Reticulum/LXMF protocol implementation, a native MeshCore protocol implementation, dashboard, Skywarn ingestion, ATAK interoperability, CAP ingestion, scheduler, daemon, async runtime, or background processing.
+Sentinel does not currently include NOAA/NWS API ingestion, a native Reticulum/LXMF protocol implementation, a native MeshCore protocol implementation, scheduler, daemon, async runtime, or background processing.
+
+Sentinel is not a general command/control platform. ATAK integration, GPS tracking, body camera integrations, map or mapping features, asset tracking platforms, team tracking platforms, and unrelated incident command systems are not in scope.
 
 ## Architecture Overview
 

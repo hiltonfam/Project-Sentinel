@@ -11,17 +11,35 @@
 * [x] Phase 4 - MeshCore sender
 * [x] Phase 4.1 - PR automation safety rails
 * [x] Phase 5 - Manual replay for spooled failures
+* [x] Phase 5.1 - Documentation update
+* [x] Phase 6.1 - Local event record contracts
+* [x] Phase 6.2 - Opt-in event emission
+* [x] Phase 6.3 - Read-only local dashboard service
+* [x] Phase 6.4 - Dashboard operator polish
+* [x] Phase 6.5 - Release engineering foundation
 
 ---
 
 ## Planned
 
-* [ ] Phase 5.1 - Documentation update
-* [ ] Phase 6 - Incident Command dashboard foundation
-* [ ] Phase 7 - Skywarn ingestion pipeline
-* [ ] Phase 8 - ATAK interoperability
+* [ ] Phase 7 - NOAA/NWS API ingestion
+* [ ] Phase 8 - Unified alert model for SAME and API alerts
 * [ ] Phase 9 - Portable Sentinel deployment kits
-* [ ] Phase 10 - Sentinel Holy Grail platform
+* [ ] Phase 10 - Release packaging and operator install flow
+
+---
+
+## Explicit Non-Scope
+
+Sentinel is not a general command/control platform. The roadmap does not include:
+
+* ATAK integration
+* GPS tracking
+* Body camera integrations
+* Map or mapping features
+* Asset tracking platforms
+* Team tracking platforms
+* Unrelated incident command systems
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## Mission
 
-Sentinel turns NOAA SAME/EAS alerts into resilient, operator-focused messages for off-grid and degraded-infrastructure communications. The current system preserves the upstream Meshtastic alerting behavior while extending it into a modular sender architecture with optional best-effort integrations and manual replay for spooled best-effort failures.
+Sentinel turns NOAA alerts into resilient, operator-focused messages for off-grid and degraded-infrastructure communications. The current system preserves the upstream NOAA Weather Radio/SAME and Meshtastic alerting behavior while extending it into a modular sender architecture with optional best-effort integrations, manual replay for spooled best-effort failures, and local read-only visibility.
 
 ## Offline-First Philosophy
 
@@ -53,7 +53,7 @@ The decoding path remains the upstream-derived behavior:
 * `Message::StartOfMessage` drives alert processing.
 * `Message::EndOfMessage` is logged.
 
-This phase does not add CAP ingestion, internet polling, Skywarn ingestion, or other alert sources.
+This phase does not add NOAA/NWS API ingestion, internet polling, or other alert sources.
 
 ## Alert Filtering Flow
 
@@ -233,13 +233,15 @@ Sentinel currently includes:
 
 Sentinel does not currently include:
 
-* CAP ingestion.
-* Skywarn ingestion.
+* NOAA/NWS API ingestion.
 * Native Reticulum/LXMF protocol implementation.
 * Native MeshCore protocol implementation.
 * Background replay workers.
-* Dashboard or incident command UI.
-* ATAK interoperability.
+* Command/control actions.
+* Map or mapping features.
+* GPS tracking.
+* Body camera integrations.
+* ATAK integration.
 * Background processing.
 * Async runtime.
 
@@ -247,7 +249,21 @@ Sentinel does not currently include:
 
 These are intended evolution points, not current features.
 
-* Replay workers: future automated processing for retrying spooled best-effort failures.
-* Dashboard: a future Incident Command dashboard foundation for operator visibility.
-* Skywarn ingestion: a future pipeline for Skywarn-related inputs.
-* ATAK: future interoperability for tactical situational awareness workflows.
+* NOAA/NWS API ingestion: future internet-available alert acquisition path.
+* Replay workers: possible future automated processing for retrying spooled best-effort failures.
+* Dashboard polish: future read-only operator visibility improvements.
+* Release packaging: future Raspberry Pi, Linux, and Windows release hardening.
+
+## Explicit Non-Scope
+
+Sentinel is not a general command/control platform.
+
+The following are not in scope:
+
+* ATAK integration.
+* GPS tracking.
+* Body camera integrations.
+* Map or mapping features.
+* Asset tracking platforms.
+* Team tracking platforms.
+* Unrelated incident command systems.
