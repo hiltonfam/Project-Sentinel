@@ -1,6 +1,7 @@
 mod alert;
 mod discord_sender;
 pub mod event_contracts;
+mod event_emitter;
 mod lxmf_sender;
 mod meshcore_sender;
 mod meshtastic_sender;
@@ -17,6 +18,8 @@ use byteorder::{NativeEndian, ReadBytesExt};
 use clap::Parser;
 use csv::ReaderBuilder;
 use discord_sender::DiscordSender;
+use event_contracts::{AlertRecord, EVENT_CONTRACT_SCHEMA_VERSION};
+use event_emitter::{warn_event_write_failure, EventEmitter, FileEventEmitter};
 use log::LevelFilter;
 use lxmf_sender::{LxmfConfig, LxmfSender};
 use meshcore_sender::{MeshCoreConfig, MeshCoreSender};
@@ -28,9 +31,12 @@ use sender::{FanOut, Sender};
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
 use spool::FileSpooler;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::{self};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use strum::EnumMessage;
 
 #[derive(RustEmbed)]
@@ -169,6 +175,10 @@ struct Args {
     /// Optional path for records that fail during one-shot replay
     #[arg(long)]
     replay_failed_output: Option<PathBuf>,
+
+    /// Optional JSONL path for local dashboard event records
+    #[arg(long)]
+    event_log_path: Option<PathBuf>,
 }
 
 fn build_best_effort_senders(args: &Args) -> Result<Vec<Box<dyn Sender>>> {
@@ -256,6 +266,12 @@ fn build_fanout(args: &Args) -> Result<FanOut> {
     Ok(fanout)
 }
 
+fn build_event_emitter(args: &Args) -> Option<Box<dyn EventEmitter>> {
+    args.event_log_path
+        .as_ref()
+        .map(|path| Box::new(FileEventEmitter::new(path.clone())) as Box<dyn EventEmitter>)
+}
+
 fn replay_mode_enabled(args: &Args) -> bool {
     args.replay_spool.is_some()
 }
@@ -283,6 +299,60 @@ fn run_replay_mode(args: &Args) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn alert_id_for(alert: &Alert, channel: u32, timestamp_unix_secs: u64) -> String {
+    let mut hasher = DefaultHasher::new();
+    alert.event.hash(&mut hasher);
+    alert.originator.hash(&mut hasher);
+    alert.callsign.hash(&mut hasher);
+    alert.is_national.hash(&mut hasher);
+    alert.is_test.hash(&mut hasher);
+    alert.location_codes.hash(&mut hasher);
+    alert.message_text.hash(&mut hasher);
+    channel.hash(&mut hasher);
+    format!(
+        "same-{}-{}-{:016x}",
+        timestamp_unix_secs,
+        channel,
+        hasher.finish()
+    )
+}
+
+fn alert_record_from_alert_at(
+    alert: &Alert,
+    channel: u32,
+    timestamp_unix_secs: u64,
+) -> AlertRecord {
+    AlertRecord {
+        schema_version: EVENT_CONTRACT_SCHEMA_VERSION,
+        record_type: "alert".to_string(),
+        alert_id: alert_id_for(alert, channel, timestamp_unix_secs),
+        timestamp_unix_secs,
+        source: "same".to_string(),
+        event: alert.event.clone(),
+        significance: alert.significance,
+        originator: alert.originator.clone(),
+        callsign: alert.callsign.clone(),
+        is_national: alert.is_national,
+        is_test: alert.is_test,
+        location_codes: alert.location_codes.clone(),
+        location_names: alert.location_names.clone(),
+        message_text: alert.message_text.clone(),
+    }
+}
+
+fn emit_alert_record(event_emitter: &mut dyn EventEmitter, record: &AlertRecord) {
+    if let Err(e) = event_emitter.emit_alert(record) {
+        warn_event_write_failure(e);
+    }
 }
 
 fn main() -> Result<()> {
@@ -328,8 +398,15 @@ fn main() -> Result<()> {
     }
 
     let mut fanout = build_fanout(&args)?;
+    let mut event_emitter = build_event_emitter(&args);
 
-    if let Err(e) = fanout.check_ready() {
+    let readiness_result = if let Some(event_emitter) = event_emitter.as_deref_mut() {
+        fanout.check_ready_with_events(event_emitter)
+    } else {
+        fanout.check_ready()
+    };
+
+    if let Err(e) = readiness_result {
         log::error!("{}", e);
         std::process::exit(1);
     }
@@ -443,9 +520,19 @@ fn main() -> Result<()> {
                     message,
                 );
 
-                fanout
-                    .send_alert(&alert, send_channel)
-                    .expect("Failed sending msg");
+                let alert_record =
+                    alert_record_from_alert_at(&alert, send_channel, unix_timestamp_secs());
+                let alert_id = alert_record.alert_id.clone();
+                if let Some(event_emitter) = event_emitter.as_deref_mut() {
+                    emit_alert_record(event_emitter, &alert_record);
+                    fanout
+                        .send_alert_with_events(&alert, send_channel, &alert_id, event_emitter)
+                        .expect("Failed sending msg");
+                } else {
+                    fanout
+                        .send_alert(&alert, send_channel)
+                        .expect("Failed sending msg");
+                }
             }
             Message::EndOfMessage => {
                 log::info!("End SAME voice message");
@@ -461,6 +548,55 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
+    use event_contracts::JsonLineRecord;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct RecordingEventEmitter {
+        alerts: Rc<RefCell<Vec<AlertRecord>>>,
+        error: Option<&'static str>,
+    }
+
+    impl RecordingEventEmitter {
+        fn new(alerts: Rc<RefCell<Vec<AlertRecord>>>) -> Self {
+            Self {
+                alerts,
+                error: None,
+            }
+        }
+
+        fn with_error(mut self, error: &'static str) -> Self {
+            self.error = Some(error);
+            self
+        }
+    }
+
+    impl EventEmitter for RecordingEventEmitter {
+        fn emit_alert(&mut self, record: &AlertRecord) -> Result<()> {
+            self.alerts.borrow_mut().push(record.clone());
+
+            if let Some(error) = self.error {
+                Err(anyhow!(error))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn emit_delivery_attempt(
+            &mut self,
+            _record: &event_contracts::DeliveryAttemptRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn emit_sender_status(
+            &mut self,
+            _record: &event_contracts::SenderStatusRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn fanout_registers_only_meshtastic_without_discord_webhook() {
@@ -497,6 +633,95 @@ mod tests {
         let args = Args::try_parse_from(["alerter", "--replay-spool", "failures.jsonl"]).unwrap();
 
         assert!(replay_mode_enabled(&args));
+    }
+
+    #[test]
+    fn event_emitter_is_not_configured_without_event_log_path() {
+        let args = Args::try_parse_from(["alerter"]).unwrap();
+
+        assert!(build_event_emitter(&args).is_none());
+    }
+
+    #[test]
+    fn event_log_path_configures_event_emitter() {
+        let args = Args::try_parse_from(["alerter", "--event-log-path", "events.jsonl"]).unwrap();
+
+        assert!(build_event_emitter(&args).is_some());
+    }
+
+    #[test]
+    fn alert_record_is_built_for_accepted_alerts() {
+        let alert = Alert::new(
+            "Tornado Warning".to_string(),
+            AlertSignificance::Warning,
+            "National Weather Service".to_string(),
+            "KXYZ".to_string(),
+            false,
+            vec!["006085".to_string()],
+            vec!["Central Santa Clara".to_string()],
+            "test alert".to_string(),
+        );
+
+        let record = alert_record_from_alert_at(&alert, 2, 123);
+
+        assert_eq!(record.schema_version, EVENT_CONTRACT_SCHEMA_VERSION);
+        assert_eq!(record.record_type, "alert");
+        assert_eq!(record.alert_id, alert_id_for(&alert, 2, 123));
+        assert_eq!(record.timestamp_unix_secs, 123);
+        assert_eq!(record.source, "same");
+        assert_eq!(record.event, "Tornado Warning");
+        assert_eq!(record.significance, AlertSignificance::Warning);
+        assert_eq!(record.originator, "National Weather Service");
+        assert_eq!(record.callsign, "KXYZ");
+        assert!(!record.is_national);
+        assert!(!record.is_test);
+        assert_eq!(record.location_codes, vec!["006085"]);
+        assert_eq!(record.location_names, vec!["Central Santa Clara"]);
+        assert_eq!(record.message_text, "test alert");
+        assert!(!record.to_json_line().contains('\n'));
+    }
+
+    #[test]
+    fn alert_record_is_emitted_for_accepted_alerts() {
+        let alerts = Rc::new(RefCell::new(Vec::new()));
+        let mut emitter = RecordingEventEmitter::new(Rc::clone(&alerts));
+        let alert = Alert::new(
+            "Tornado Warning".to_string(),
+            AlertSignificance::Warning,
+            "National Weather Service".to_string(),
+            "KXYZ".to_string(),
+            false,
+            vec!["006085".to_string()],
+            vec!["Central Santa Clara".to_string()],
+            "test alert".to_string(),
+        );
+        let record = alert_record_from_alert_at(&alert, 2, 123);
+
+        emit_alert_record(&mut emitter, &record);
+
+        assert_eq!(*alerts.borrow(), vec![record]);
+    }
+
+    #[test]
+    fn alert_event_write_failure_does_not_panic() {
+        let alerts = Rc::new(RefCell::new(Vec::new()));
+        let mut emitter =
+            RecordingEventEmitter::new(Rc::clone(&alerts)).with_error("disk unavailable");
+        let alert = Alert::new(
+            "Tornado Warning".to_string(),
+            AlertSignificance::Warning,
+            "National Weather Service".to_string(),
+            "KXYZ".to_string(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            "test alert".to_string(),
+        );
+        let record = alert_record_from_alert_at(&alert, 0, 123);
+
+        emit_alert_record(&mut emitter, &record);
+
+        assert_eq!(*alerts.borrow(), vec![record]);
     }
 
     #[test]

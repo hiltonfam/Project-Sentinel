@@ -4,7 +4,9 @@
 
 These contracts define append-friendly local records that future Sentinel dashboard components can read. They are designed for local files, offline operation, and Pelican-case deployments where cloud services may be unavailable.
 
-Phase 6.1 defines the data shapes only. Sentinel does not yet emit these records during live monitoring, and no dashboard service, HTTP server, UI, database, scheduler, or background worker is introduced by this phase.
+Phase 6.1 defined the data shapes. Phase 6.2 adds opt-in local event emission with `--event-log-path <PATH>`.
+
+Sentinel does not emit these records unless `--event-log-path` is provided. No dashboard service, HTTP server, UI, database, scheduler, or background worker is introduced by event emission.
 
 ## Design Principles
 
@@ -25,6 +27,25 @@ The preferred on-disk format is JSON Lines:
 ```
 
 Writers should append complete lines. Readers should tolerate malformed lines by reporting or skipping them rather than failing the whole dashboard view.
+
+## Opt-In Emission
+
+Event emission is disabled by default.
+
+```sh
+Meshtastic-SAME-EAS-Alerter --event-log-path sentinel-events.jsonl
+```
+
+When enabled, Sentinel appends event records to the configured file. Event write failures are logged as warnings only and do not block alert delivery.
+
+Current emission behavior:
+
+* `AlertRecord` is written after an alert passes SAME filtering and before fan-out delivery.
+* `DeliveryAttemptRecord` is written after observable sender attempts.
+* `SenderStatusRecord` is written after sender readiness checks.
+* `SystemStatusRecord` remains a defined contract but is not emitted yet.
+
+If `--event-log-path` is absent, Sentinel does not write event records.
 
 ## Common Fields
 
@@ -141,7 +162,6 @@ This contract does not require:
 * SQLite or another database.
 * Cloud connectivity.
 * Background workers.
-* Live event emission.
 * Dashboard-driven alert delivery.
 
 ## Future Compatibility Notes
